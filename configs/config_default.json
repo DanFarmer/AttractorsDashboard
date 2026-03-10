@@ -1,0 +1,38 @@
+{
+  "meta": {
+    "saved_at": "2026-03-03T15:34:21.947889Z",
+    "name": "config_default"
+  },
+  "global": {
+    "hiddenSize": 64,
+    "num_layers": 3,
+    "dropout": 0.2,
+    "bidirectional": true,
+    "learning_rate": 1e-05,
+    "batch_size": 32,
+    "window": 20,
+    "epochs": 20,
+    "optimizer": "Adam",
+    "activation": "ReLU"
+  },
+  "layer_configs": [
+    {
+      "type": "Conv1D",
+      "hiddenSize": 64,
+      "dropout": 0.2,
+      "bidirectional": false,
+      "kernel_size": 3
+    },
+    {
+      "type": "LSTM",
+      "hiddenSize": 128,
+      "dropout": 0.2,
+      "bidirectional": false
+    },
+    {
+      "hiddenSize": 64,
+      "dropout": 0.2,
+      "bidirectional": false
+    }
+  ]
+}
