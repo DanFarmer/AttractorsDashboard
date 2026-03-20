@@ -11,6 +11,7 @@ import json
 import tensorflow as tf
 import os
 import re
+import time
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -290,15 +291,31 @@ def evaluateConfig(column, df, attractionJson, baseConfig, trialCfg, quickEpochs
     optimizer = opt_cls(learning_rate=float(cfg.get('learningRate', 1e-3)))
     model.compile(optimizer=optimizer, loss='mse')
 
-    history = model.fit(train_ds, validation_data=val_ds, epochs=quick_epochs, verbose=0)
+    t0 = time.time()
+    history = model.fit(train_ds, validation_data=val_ds, epochs=quickEpochs, verbose=0)
+    train_time_s = time.time() - t0
+
     val_losses = history.history.get('val_loss', [])
-    return float(val_losses[-1]) if len(val_losses) else float('inf')
+    final_val_loss = float(val_losses[-1]) if len(val_losses) else float('inf')
+
+    # Count total trainable parameters as a proxy for model size
+    try:
+        model_params = int(sum(np.prod(v.shape) for v in model.trainable_variables))
+    except Exception:
+        model_params = 0
+
+    return {
+        'valLoss': final_val_loss,
+        'trainTimeS': float(train_time_s),
+        'modelParams': model_params
+    }
 
 
 def hyperparameterSearch(column, df, attractionJson, baseConfig, searchOpts):
     """Simple random search over ranges in searchOpts; returns best trial and loss."""
     trials = int(searchOpts.get('trials', 10))
     best = {'loss': float('inf'), 'cfg': None}
+    trial_records = []
     for t in range(trials):
         # sample params
         hid = int(random.randint(searchOpts.get('hidden_min', 16), searchOpts.get('hidden_max', 256)))
@@ -310,11 +327,38 @@ def hyperparameterSearch(column, df, attractionJson, baseConfig, searchOpts):
         opt = random.choice(searchOpts.get('optimizer_choices', [baseConfig.get('optimizer', 'Adam')]))
         bid = random.choice(searchOpts.get('bidir_choices', [baseConfig.get('bidirectional', False)]))
 
-        trialCfg = {'hiddenSize': hid, 'dropout': drop, 'learning_rate': lr, 'batch_size': batch, 'num_layers': nl, 'optimizer': opt, 'bidirectional': bid}
-        loss = evaluateConfig(column, df, attractionJson, baseConfig, trialCfg, quickEpochs=searchOpts.get('quick_epochs', 5))
+        trialCfg = {
+            'hiddenSize': hid,
+            'dropout': drop,
+            'learningRate': lr,
+            'batchSize': batch,
+            'numLayers': nl,
+            'optimizer': opt,
+            'bidirectional': bid
+        }
+        eval_result = evaluateConfig(column, df, attractionJson, baseConfig, trialCfg, quickEpochs=searchOpts.get('quick_epochs', 5))
+        loss = eval_result.get('valLoss', float('inf')) if isinstance(eval_result, dict) else float(eval_result)
+        train_time_s = eval_result.get('trainTimeS', 0.0) if isinstance(eval_result, dict) else 0.0
+        model_params = eval_result.get('modelParams', 0) if isinstance(eval_result, dict) else 0
+        trial_records.append({
+            'trial': t + 1,
+            'hiddenSize': hid,
+            'dropout': drop,
+            'learningRate': lr,
+            'batchSize': batch,
+            'numLayers': nl,
+            'optimizer': opt,
+            'bidirectional': bool(bid),
+            'valLoss': float(loss),
+            'trainTimeS': float(train_time_s),
+            'modelParams': int(model_params)
+        })
         if loss < best['loss']:
             best = {'loss': loss, 'cfg': dict(trialCfg)}
-    return best
+    return {
+        'best': best,
+        'trials': trial_records
+    }
 
 
 # ============================================================
@@ -341,7 +385,25 @@ if uploaded:
     dataContainer.dataframe(numericDf.head())
 
     dataContainer.subheader("Missing Values per Column",help="Count of missing values in each column. High counts may indicate issues with data collection or the need for imputation strategies. Consider dropping columns with excessive missingness or using imputation techniques to fill in missing values based on the nature of the data and the analysis goals.")
-    dataContainer.bar_chart(numericDf.isna().sum())
+    missing_sort_mode = dataContainer.radio(
+        "Missing-value bar order",
+        ["Dataframe order", "Ascending missing count"],
+        horizontal=True,
+        key='missing_sort_mode'
+    )
+    missing_counts = numericDf.isna().sum()
+    if missing_sort_mode == "Ascending missing count":
+        missing_counts = missing_counts.sort_values(ascending=True)
+    else:
+        missing_counts = missing_counts.reindex(numericDf.columns)
+
+    missing_plot_df = pd.DataFrame({
+        'column': missing_counts.index,
+        'missing_count': missing_counts.values
+    })
+    fig_missing_bar = px.bar(missing_plot_df, x='column', y='missing_count', labels={'column': 'Column', 'missing_count': 'Missing Values'})
+    fig_missing_bar.update_xaxes(categoryorder='array', categoryarray=missing_plot_df['column'].tolist())
+    dataContainer.plotly_chart(fig_missing_bar, use_container_width=True)
 
     dataContainer.subheader("Missing Data Heatmap",help="Visual representation of missing values in the dataset. Each row corresponds to a record and each column corresponds to a feature. Yellow indicates missing values, while blue indicates present values. This can help identify patterns of missingness, such as entire columns or rows that are missing data, which may inform data cleaning or imputation strategies.")
     fig_missing = px.imshow(numericDf.isna(), aspect="auto")
@@ -380,6 +442,104 @@ if uploaded:
 
     resultsDf = pd.DataFrame(results)
     attractionJson = resultsDf.to_dict(orient="records")
+
+    attractorContainer.subheader("Attraction Coefficient Chord Diagram",help="A circular chord-style diagram visualizing feature relationships from absolute correlation coefficients. Nodes are arranged around a circle and curved interior links represent pairwise relationships; thicker and darker chords indicate stronger relationships.")
+    # Plotly graph_objects does not provide go.Chord; draw a circular chord-style chart using curved line traces.
+    feature_names = corr_matrix.columns.tolist()
+    node_idx = {name: i for i, name in enumerate(feature_names)}
+
+    # Build links from upper-triangle feature pairs
+    pair_links = []
+    for c1, c2 in itertools.combinations(feature_names, 2):
+        coef = float(abs(corr_matrix.loc[c1, c2]))
+        if not np.isnan(coef) and coef > 0:
+            pair_links.append((c1, c2, coef))
+
+    # Keep the diagram readable for larger datasets by limiting to strongest links
+    max_links = 120
+    pair_links = sorted(pair_links, key=lambda x: x[2], reverse=True)#[:max_links]
+    pair_links = [entry for entry in pair_links if entry[2] > attractionThreshold]
+
+    if pair_links:
+        n_nodes = len(feature_names)
+        angles = np.linspace(0, 2 * np.pi, n_nodes, endpoint=False)
+        radius = 1.0
+        node_x = radius * np.cos(angles)
+        node_y = radius * np.sin(angles)
+
+        # map name -> (x,y)
+        pos = {name: (node_x[idx], node_y[idx]) for name, idx in node_idx.items()}
+
+        # chord widths/opacities scaled by coefficient strength
+        vals = np.array([v for _, _, v in pair_links], dtype=float)
+        vmin, vmax = float(vals.min()), float(vals.max())
+        denom = (vmax - vmin) if vmax > vmin else 1.0
+
+        fig_rel = go.Figure()
+
+        # Draw curved links (quadratic Bezier via center control)
+        for src, tgt, val in pair_links:
+            x0, y0 = pos[src]
+            x1, y1 = pos[tgt]
+
+            t = np.linspace(0, 1, 24)
+            # control point at center creates an inward "chord" arc
+            cx, cy = 0.0, 0.0
+            bx = (1 - t) ** 2 * x0 + 2 * (1 - t) * t * cx + t ** 2 * x1
+            by = (1 - t) ** 2 * y0 + 2 * (1 - t) * t * cy + t ** 2 * y1
+
+            strength = (val - vmin) / denom
+            width = 0.8 + 4.0 * strength
+            alpha = 0.15 + 0.55 * strength
+
+            fig_rel.add_trace(go.Scatter(
+                x=bx,
+                y=by,
+                mode='lines',
+                hoverinfo='text',
+                text=[f"{src} ↔ {tgt}<br>|corr|={val:.3f}"] * len(bx),
+                line=dict(color=f'rgba(30, 120, 180, {alpha:.3f})', width=width),
+                showlegend=False
+            ))
+
+        # Draw outer circle guide
+        circle_t = np.linspace(0, 2 * np.pi, 300)
+        fig_rel.add_trace(go.Scatter(
+            x=1.03 * np.cos(circle_t),
+            y=1.03 * np.sin(circle_t),
+            mode='lines',
+            line=dict(color='rgba(80,80,80,0.35)', width=1),
+            hoverinfo='skip',
+            showlegend=False
+        ))
+
+        # Draw nodes and labels
+        fig_rel.add_trace(go.Scatter(
+            x=node_x,
+            y=node_y,
+            mode='markers+text',
+            text=feature_names,
+            textposition='middle center',
+            marker=dict(size=10, color='midnightblue'),
+            hoverinfo='text',
+            hovertext=[f"Feature: {n}" for n in feature_names],
+            showlegend=False
+        ))
+
+        fig_rel.update_layout(
+            title="Feature Correlation Chord Diagram",
+            width=900,
+            height=900,
+            xaxis=dict(visible=False, scaleanchor='y', scaleratio=1),
+            yaxis=dict(visible=False),
+            plot_bgcolor='white',
+            margin=dict(l=20, r=20, t=60, b=20)
+        )
+        attractorContainer.plotly_chart(fig_rel, use_container_width=True)
+    else:
+        attractorContainer.info("No non-zero relationships available to plot.")
+    
+    
 
     attractorContainer.subheader("Attraction Coefficient Distribution",help="Distribution of the absolute correlation coefficients between features, which represent the strength of the relationship between potential driver features and target features. The selection of drivers for the predictive model is based on these coefficients and the chosen thresholding method. The histogram is colored to indicate which coefficients are considered 'selected' based on the threshold, with a dashed red line indicating the cutoff value used for selection.")
     # Determine which coefficients are considered "selected" according to thresholdMetric
@@ -709,12 +869,135 @@ if uploaded:
             tuneResults = {}
             progress = MLContainer.progress(0)
             for i, col in enumerate(selected_targets):
-                best = hyperparameterSearch(col, numericDf, attractionJson, config, config.get('tuneOpts', {}))
-                tuneResults[col] = best
+                search_out = hyperparameterSearch(col, numericDf, attractionJson, config, config.get('tuneOpts', {}))
+                tuneResults[col] = search_out
                 progress.progress(int((i + 1) / len(selected_targets) * 100))
             st.session_state['tuneResults'] = tuneResults
             MLContainer.success('Auto-tune complete')
-            MLContainer.write(tuneResults)
+            MLContainer.write({k: v.get('best') for k, v in tuneResults.items()})
+
+    # Auto-tune diagnostics visualization
+    if 'tuneResults' in st.session_state and st.session_state['tuneResults']:
+        MLContainer.subheader("Auto-tune Architecture Performance", help="Parallel-coordinates view of all hyperparameter trials from auto-tune. Each polyline is one trial. Use the Highlight control to emphasise the best model by a given criterion. Axes include training time and total parameter count so architectural trade-offs are visible.")
+        tuned_targets = sorted(list(st.session_state['tuneResults'].keys()))
+        chosen_tuned_target = MLContainer.selectbox("Target for Auto-tune Plot", tuned_targets, key='tuned_target_for_parallel')
+
+        highlight_mode = MLContainer.radio(
+            "Highlight",
+            ["Lowest Validation Loss", "Fastest Training", "Smallest Model", "None"],
+            horizontal=True,
+            key='tune_highlight_mode',
+            help="Dim all trials except the one that wins the selected criterion."
+        )
+
+        chosen_payload = st.session_state['tuneResults'].get(chosen_tuned_target, {})
+        trial_rows = chosen_payload.get('trials', []) if isinstance(chosen_payload, dict) else []
+
+        if trial_rows:
+            tune_df = pd.DataFrame(trial_rows)
+            # ensure new columns exist for runs recorded before this version
+            for _col, _default in [('trainTimeS', 0.0), ('modelParams', 0)]:
+                if _col not in tune_df.columns:
+                    tune_df[_col] = _default
+            tune_df = tune_df.replace([np.inf, -np.inf], np.nan).dropna(subset=['valLoss'])
+
+            if not tune_df.empty:
+                # Encode categorical options for parallel-coordinates numeric axes
+                optimizer_values = sorted(tune_df['optimizer'].dropna().unique().tolist())
+                optimizer_map = {name: idx for idx, name in enumerate(optimizer_values)}
+                tune_df['optimizerCode'] = tune_df['optimizer'].map(optimizer_map).astype(float)
+                tune_df['bidirectionalCode'] = tune_df['bidirectional'].astype(int)
+                tune_df['log10LearningRate'] = np.log10(tune_df['learningRate'].clip(lower=1e-12))
+
+                # Determine highlight index
+                highlight_idx = None
+                if highlight_mode == "Lowest Validation Loss":
+                    highlight_idx = int(tune_df['valLoss'].idxmin())
+                elif highlight_mode == "Fastest Training":
+                    highlight_idx = int(tune_df['trainTimeS'].idxmin())
+                elif highlight_mode == "Smallest Model":
+                    highlight_idx = int(tune_df['modelParams'].idxmin())
+
+                # Build a line opacity column: 1.0 for highlighted, 0.08 for others
+                if highlight_idx is not None:
+                    tune_df['_opacity'] = 0.08
+                    tune_df['_width'] = 1
+                    tune_df.loc[highlight_idx, '_opacity'] = 1.0
+                else:
+                    tune_df['_opacity'] = 1.0
+
+                # For highlight mode: colour = opacity bucket (1 = bright, 0 = dim)
+                tune_df['_colorKey'] = tune_df['_opacity'].apply(lambda v: 1.0 if v == 1.0 else 0.0)
+                color_col = '_colorKey' if highlight_idx is not None else 'valLoss'
+                color_scale = (
+                    [[0.0, 'rgba(100,100,100,0.01)'], [1.0, 'rgba(255,255,0,2)']]
+                    if highlight_idx is not None
+                    else px.colors.sequential.Viridis_r
+                )
+
+                _labels = {
+                    'hiddenSize': 'Hidden Size',
+                    'dropout': 'Dropout',
+                    'numLayers': 'Num Layers',
+                    'batchSize': 'Batch Size',
+                    'log10LearningRate': 'log10(LR)',
+                    'bidirectionalCode': 'Bidirectional',
+                    'optimizerCode': 'Optimizer',
+                    'valLoss': 'Val Loss',
+                    'trainTimeS': 'Train Time (s)',
+                    'modelParams': 'Model Params',
+                }
+
+                fig_parallel = px.parallel_coordinates(
+                    tune_df,
+                    dimensions=[
+                        'hiddenSize',
+                        'numLayers',
+                        'dropout',
+                        'batchSize',
+                        'log10LearningRate',
+                        'bidirectionalCode',
+                        'optimizerCode',
+                        'trainTimeS',
+                        'modelParams',
+                        'valLoss'
+                    ],
+                    color=color_col,
+                    color_continuous_scale=color_scale,
+                    labels=_labels
+                )
+                fig_parallel.update_layout(
+                    height=580,
+                    coloraxis_showscale=(highlight_idx is None)
+                )
+                MLContainer.plotly_chart(fig_parallel, use_container_width=True)
+
+                if optimizer_map:
+                    optimizer_legend = ", ".join([f"{v} = {k}" for k, v in optimizer_map.items()])
+                    MLContainer.caption(f"Optimizer axis codes: {optimizer_legend}")
+
+                # Summary callout for highlighted trial
+                if highlight_idx is not None:
+                    h = tune_df.loc[highlight_idx]
+                    MLContainer.info(
+                        f"**Highlighted trial #{int(h['trial'])}** — "
+                        f"Val Loss: {h['valLoss']:.5f} | "
+                        f"Train Time: {h['trainTimeS']:.2f}s | "
+                        f"Params: {int(h['modelParams']):,} | "
+                        f"Hidden: {int(h['hiddenSize'])} | "
+                        f"Layers: {int(h['numLayers'])} | "
+                        f"LR: {h['learningRate']:.2e} | "
+                        f"Optimizer: {h['optimizer']}"
+                    )
+                else:
+                    best_payload = chosen_payload.get('best', {}) if isinstance(chosen_payload, dict) else {}
+                    MLContainer.write(f"Best validation loss for **{chosen_tuned_target}**: `{best_payload.get('loss', float('nan')):.5f}`")
+            else:
+                MLContainer.info("No valid auto-tune trials available to plot.")
+        else:
+            MLContainer.info("No trial history found for this target. Run Auto-tune to generate trial data.")
+
+        
 
     # ========================================================
     # --------------------- SHOW RESULTS ---------------------
@@ -742,7 +1025,7 @@ if uploaded:
 
     MLContainer.subheader("Infill / Forecast",help="Generate infilled and forecasted versions of the dataset. This process fills missing values in selected target columns using trained models and extends the dataset by forecasting future values.")
 
-    forecast_steps = MLContainer.slider("Forecast Steps", 0, 1000, 0)
+    forecast_steps = MLContainer.slider("Forecast Steps", 0, 1000, 0)## forecast_steps can be set to 0 to disable forecasting and only perform infilling
 
     if MLContainer.button("Generate Infilled Dataset"):
 
@@ -762,47 +1045,223 @@ if uploaded:
         if not to_infill:
             MLContainer.info("No trained columns available to infill.")
         else:
-            for column in to_infill:
-                # try to find drivers length from trained model metadata
-                meta = trained_columns.get(column, {})
-                drivers = meta.get("drivers") or []
-                inputSize = len(drivers) if drivers else (len(numericDf.columns) - 1)
+            # Number of MC-dropout forward passes for uncertainty estimation
+            N_MC = 20
 
-                # create model matching training input size
-                model = CustomLSTM(
+            def _safeName(s):
+                return re.sub(r'[^A-Za-z0-9._-]+', '_', s)
+
+            def _load_model(column, drivers, inputSize):
+                m = CustomLSTM(
                     inputSize=inputSize,
-                    layer_configs=config.get('layer_configs', None),
+                    layer_configs=config.get('layerConfigs', None),
                     activation=activation,
                     window=window
                 )
-
-                # load Keras weights
-                def safeName(s):
-                    return re.sub(r'[^A-Za-z0-9._-]+', '_', s)
-
-                weights_fname = f"{safeName(column)}.weights.h5"
-                weights_path = os.path.join("models", weights_fname)
-
-                # ensure model is built before loading weights
                 try:
-                    model.build((None, window, inputSize))
+                    m.build((None, window, inputSize))
                 except Exception:
                     try:
                         dummy = np.zeros((1, window, inputSize), dtype=np.float32)
-                        _ = model(tf.convert_to_tensor(dummy))
+                        _ = m(tf.convert_to_tensor(dummy))
                     except Exception:
                         pass
+                wp = os.path.join("models", f"{_safeName(column)}.weights.h5")
+                if os.path.exists(wp):
+                    m.load_weights(wp)
+                m.trainable = False
+                return m
 
-                if os.path.exists(weights_path):
-                    model.load_weights(weights_path)
-                model.trainable = False
+            def _mc_predict(model, batch_tensor, n_mc):
+                """Run N MC-dropout passes; return (mean, std) arrays of shape (B,)."""
+                passes = np.stack([
+                    model(batch_tensor, training=True).numpy().squeeze(-1)
+                    for _ in range(n_mc)
+                ])  # (N_MC, B)
+                return passes.mean(axis=0), passes.std(axis=0)
 
-                # Simplified infill logic for trained column
-                dfFilled[column] = dfFilled[column].fillna(dfFilled[column].mean())
+            # Interpolate driver columns so predictions have clean inputs
+            df_interp = dfFilled.copy()
+            for col in numericDf.columns:
+                df_interp[col] = df_interp[col].interpolate().bfill().ffill()
 
-        # Forecasting (naive extension)
-        for i in range(forecast_steps):
-            dfFilled.loc[len(dfFilled)] = dfFilled.iloc[-1]
+            infill_plots = {}  # column -> plot-data dict
+
+            for column in to_infill:
+                meta = trained_columns.get(column, {})
+                drivers = meta.get("drivers") or []
+                inputSize = len(drivers) if drivers else max(1, len(numericDf.columns) - 1)
+                other_cols = [c for c in numericDf.columns if c != column]
+
+                # Record original missing mask
+                original_missing = numericDf[column].isna().values.copy()
+
+                model = _load_model(column, drivers, inputSize)
+
+                # Build driver array from interpolated copy
+                X_all = (df_interp[drivers].values if drivers else df_interp[other_cols].values).astype(np.float32)
+                n = len(X_all)
+
+                # Identify all positions where we have a complete window
+                valid_positions = [
+                    i for i in range(n - window)
+                    if not np.any(np.isnan(X_all[i:i + window]))
+                ]
+
+                pred_mean = np.full(n, np.nan)
+                pred_std  = np.full(n, np.nan)
+
+                if valid_positions:
+                    batch_X = np.stack([X_all[i:i + window] for i in valid_positions])
+                    means, stds = _mc_predict(model, tf.convert_to_tensor(batch_X), N_MC)
+                    for k, pos in enumerate(valid_positions):
+                        pred_mean[pos + window] = float(means[k])
+                        pred_std[pos + window]  = float(stds[k])
+
+                # Apply predictions to fill missing positions
+                y_vals = dfFilled[column].values.copy().astype(float)
+                infilled_indices = []
+                for i in range(n):
+                    if original_missing[i] and not np.isnan(pred_mean[i]):
+                        y_vals[i] = pred_mean[i]
+                        infilled_indices.append(i)
+                dfFilled[column] = y_vals
+
+                infill_plots[column] = {
+                    'original':        numericDf[column].values.copy().astype(float),
+                    'filled':          y_vals,
+                    'pred_mean':       pred_mean,
+                    'pred_std':        pred_std,
+                    'missing_mask':    original_missing,
+                    'n_original':      n,
+                    'drivers':         drivers,
+                    'inputSize':       inputSize,
+                    'other_cols':      other_cols,
+                }
+
+            # ---- Forecasting ----
+            n_original = len(dfFilled)
+            forecast_records = {}  # column -> {'means': [], 'stds': []}
+
+            for column in to_infill:
+                pdata = infill_plots[column]
+                drivers   = pdata['drivers']
+                inputSize = pdata['inputSize']
+                other_cols = pdata['other_cols']
+
+                if forecast_steps <= 0:
+                    continue
+
+                model = _load_model(column, drivers, inputSize)
+
+                # Seed rolling window from filled data
+                seed_src = dfFilled[drivers].values if drivers else dfFilled[other_cols].values
+                rolling = seed_src[-window:].astype(np.float32).copy()
+
+                fc_means, fc_stds = [], []
+                for _ in range(forecast_steps):
+                    t = tf.convert_to_tensor(rolling[np.newaxis])
+                    m_val, s_val = _mc_predict(model, t, N_MC)
+                    fc_means.append(float(m_val[0]))
+                    fc_stds.append(float(s_val[0]))
+                    # Advance rolling window: use predicted value for first feature slot
+                    next_row = rolling[-1].copy()
+                    next_row[0] = float(m_val[0])
+                    rolling = np.vstack([rolling[1:], next_row[np.newaxis]])
+
+                forecast_records[column] = {'means': fc_means, 'stds': fc_stds}
+
+            # Extend dfFilled rows for forecast
+            if forecast_steps > 0:
+                last_row = dfFilled.iloc[-1].copy()
+                ext = pd.DataFrame([last_row] * forecast_steps)
+                ext.index = range(n_original, n_original + forecast_steps)
+                dfFilled = pd.concat([dfFilled, ext])
+                for column in to_infill:
+                    if column in forecast_records:
+                        for i, fm in enumerate(forecast_records[column]['means']):
+                            dfFilled.loc[n_original + i, column] = fm
+
+            # ---- Plot each infilled column ----
+            for column in to_infill:
+                pdata = infill_plots.get(column)
+                if pdata is None:
+                    continue
+
+                orig         = pdata['original']
+                missing_mask = pdata['missing_mask']
+                pred_mean    = pdata['pred_mean']
+                pred_std     = pdata['pred_std']
+                n_orig       = pdata['n_original']
+                x_all        = list(range(n_orig))
+
+                fig = go.Figure()
+
+                # 1. Observed (non-missing) values
+                known_x = [i for i in x_all if not missing_mask[i]]
+                known_y = [orig[i] for i in known_x]
+                fig.add_trace(go.Scatter(
+                    x=known_x, y=known_y,
+                    mode='lines',
+                    name='Observed',
+                    line=dict(color='steelblue', width=2)
+                ))
+
+                # 2. Infilled values with 95 % CI band
+                infill_x = [i for i in x_all if missing_mask[i] and not np.isnan(pred_mean[i])]
+                if infill_x:
+                    inf_y     = [pred_mean[i] for i in infill_x]
+                    inf_upper = [pred_mean[i] + 1.96 * pred_std[i] for i in infill_x]
+                    inf_lower = [pred_mean[i] - 1.96 * pred_std[i] for i in infill_x]
+
+                    fig.add_trace(go.Scatter(
+                        x=infill_x + infill_x[::-1],
+                        y=inf_upper + inf_lower[::-1],
+                        fill='toself',
+                        fillcolor='rgba(255, 140, 0, 0.20)',
+                        line=dict(color='rgba(0,0,0,0)'),
+                        name='Infill 95% CI',
+                        showlegend=True
+                    ))
+                    fig.add_trace(go.Scatter(
+                        x=infill_x, y=inf_y,
+                        mode='markers',
+                        name='Infilled',
+                        marker=dict(color='darkorange', size=6, symbol='circle')
+                    ))
+
+                # 3. Forecast with 95 % CI band
+                if column in forecast_records and forecast_steps > 0:
+                    fc = forecast_records[column]
+                    fc_x     = list(range(n_orig, n_orig + forecast_steps))
+                    fc_means_arr = fc['means']
+                    fc_stds_arr  = fc['stds']
+                    fc_upper = [m + 1.96 * s for m, s in zip(fc_means_arr, fc_stds_arr)]
+                    fc_lower = [m - 1.96 * s for m, s in zip(fc_means_arr, fc_stds_arr)]
+
+                    fig.add_trace(go.Scatter(
+                        x=fc_x + fc_x[::-1],
+                        y=fc_upper + fc_lower[::-1],
+                        fill='toself',
+                        fillcolor='rgba(128, 0, 200, 0.15)',
+                        line=dict(color='rgba(0,0,0,0)'),
+                        name='Forecast 95% CI',
+                        showlegend=True
+                    ))
+                    fig.add_trace(go.Scatter(
+                        x=fc_x, y=fc_means_arr,
+                        mode='lines',
+                        name='Forecast',
+                        line=dict(color='mediumpurple', width=2, dash='dash')
+                    ))
+
+                fig.update_layout(
+                    title=f"{column}: Observed / Infilled / Forecast",
+                    xaxis_title="Time Index",
+                    yaxis_title=column,
+                    legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1)
+                )
+                MLContainer.plotly_chart(fig, use_container_width=True)
 
         st.success("Infilled / Forecasted dataset ready.")
 
