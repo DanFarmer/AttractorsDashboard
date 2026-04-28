@@ -12,6 +12,8 @@ import tensorflow as tf
 import os
 import re
 import time
+from scipy import signal
+from scipy.stats import spearmanr, pearsonr
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -164,6 +166,310 @@ def getSafeDevice():
         except Exception:
             return 'cpu'
     return 'cpu'
+
+
+# ============================================================
+# ------------------- CORRELATION METHODS -------------------
+# ============================================================
+
+def compute_ccm_correlation(series1, series2, embedding_dim=3, tau=1):
+    """
+    Simplified Convergent Cross-Mapping (CCM) correlation.
+    Measures causality from series2 -> series1 using dynamic embedding.
+    
+    Returns a correlation-like score (0-1) indicating the strength of the relationship.
+    """
+    try:
+        if len(series1) < embedding_dim * tau + 1 or len(series2) < embedding_dim * tau + 1:
+            return 0.0
+        
+        # Create time-delay embedding from series2
+        n = len(series2) - (embedding_dim - 1) * tau
+        embedded = np.zeros((n, embedding_dim))
+        
+        for i in range(embedding_dim):
+            embedded[:, i] = series2[i*tau : i*tau + n]
+        
+        # Match with series1 predictor positions
+        series1_predict = series1[(embedding_dim - 1) * tau : (embedding_dim - 1) * tau + n]
+        
+        # Use nearest neighbor prediction skill as correlation measure
+        from sklearn.neighbors import NearestNeighbors
+        nbrs = NearestNeighbors(n_neighbors=min(10, n // 2), algorithm='ball_tree').fit(embedded)
+        distances, indices = nbrs.kneighbors(embedded)
+        
+        # Average nearest neighbor skill
+        predictions = np.zeros(n)
+        for i in range(n):
+            # Use mean of k-nearest neighbors
+            neighbor_values = series1_predict[indices[i]]
+            predictions[i] = np.mean(neighbor_values)
+        
+        # Correlation between predicted and actual
+        if np.std(predictions) > 0 and np.std(series1_predict) > 0:
+            ccm_skill = abs(np.corrcoef(predictions, series1_predict)[0, 1])
+            return float(ccm_skill) if not np.isnan(ccm_skill) else 0.0
+        return 0.0
+    except Exception as e:
+        return 0.0
+
+
+def compute_smap_correlation(series1, series2, embedding_dim=3, tau=1, theta=None):
+    """
+    Simplified S-Map (Sequential Locally-Weighted Simplex Mapping) correlation.
+    Measures both correlation strength and nonlinearity.
+    
+    Returns correlation-like score (0-1).
+    """
+    try:
+        if len(series1) < embedding_dim * tau + 1 or len(series2) < embedding_dim * tau + 1:
+            return 0.0
+        
+        # Create time-delay embedding from series2
+        n = len(series2) - (embedding_dim - 1) * tau
+        embedded = np.zeros((n, embedding_dim))
+        
+        for i in range(embedding_dim):
+            embedded[:, i] = series2[i*tau : i*tau + n]
+        
+        series1_values = series1[(embedding_dim - 1) * tau : (embedding_dim - 1) * tau + n]
+        
+        # S-Map: locally weighted least-squares regression
+        if theta is None:
+            theta = 0.5  # nonlinearity parameter
+        
+        predictions = np.zeros(n)
+        
+        from sklearn.neighbors import NearestNeighbors
+        nbrs = NearestNeighbors(n_neighbors=min(embedding_dim + 2, n // 2), algorithm='ball_tree').fit(embedded)
+        distances, indices = nbrs.kneighbors(embedded)
+        
+        for i in range(n):
+            # Exponential weighting based on distance
+            neighbor_distances = distances[i]
+            max_dist = neighbor_distances[-1]
+            if max_dist > 0:
+                weights = np.exp(-theta * neighbor_distances / max_dist)
+            else:
+                weights = np.ones_like(neighbor_distances)
+            
+            # Weighted mean prediction
+            neighbor_values = series1_values[indices[i]]
+            predictions[i] = np.average(neighbor_values, weights=weights)
+        
+        # Skill measure
+        if np.std(predictions) > 0 and np.std(series1_values) > 0:
+            smap_skill = abs(np.corrcoef(predictions, series1_values)[0, 1])
+            return float(smap_skill) if not np.isnan(smap_skill) else 0.0
+        return 0.0
+    except Exception:
+        return 0.0
+
+
+def compute_correlation_matrix(df, method='pearson', embedding_dim=3, tau=1):
+    """
+    Compute correlation matrix using specified method.
+    
+    Methods: 'pearson', 'spearman', 'ccm', 'smap'
+    """
+    try:
+        if method == 'pearson':
+            return df.corr(method='pearson')
+        elif method == 'spearman':
+            return df.corr(method='spearman')
+        elif method in ('ccm', 'smap'):
+            # For CCM and S-Map, compute pairwise correlations
+            n_cols = len(df.columns)
+            corr_matrix = np.zeros((n_cols, n_cols))
+            
+            for i in range(n_cols):
+                for j in range(n_cols):
+                    if i == j:
+                        corr_matrix[i, j] = 1.0
+                    else:
+                        # Handle NaN values by forward filling and interpolating
+                        s1 = df.iloc[:, i].interpolate().bfill().ffill().fillna(df.iloc[:, i].mean()).values
+                        s2 = df.iloc[:, j].interpolate().bfill().ffill().fillna(df.iloc[:, j].mean()).values
+                        
+                        if method == 'ccm':
+                            corr_matrix[i, j] = compute_ccm_correlation(s1, s2, embedding_dim, tau)
+                        else:  # smap
+                            corr_matrix[i, j] = compute_smap_correlation(s1, s2, embedding_dim, tau)
+            
+            return pd.DataFrame(corr_matrix, index=df.columns, columns=df.columns)
+        else:
+            return df.corr(method='pearson')
+    except Exception as e:
+        # Fallback to pearson
+        return df.corr(method='pearson')
+
+
+def parse_time_axis(df):
+    """Best-effort datetime axis extraction; returns datetime Series or None."""
+    # Prefer explicit datetime-like column names first
+    candidates = [c for c in df.columns if re.search(r'date|time', str(c), re.IGNORECASE)]
+    ordered_cols = candidates + [c for c in df.columns if c not in candidates]
+
+    for col in ordered_cols:
+        try:
+            parsed = pd.to_datetime(df[col], errors='coerce')
+            valid_ratio = float(parsed.notna().mean()) if len(parsed) else 0.0
+            if valid_ratio >= 0.6:
+                return parsed
+        except Exception:
+            continue
+    return None
+
+
+def _norm_text(s):
+    return re.sub(r'\s+', ' ', str(s).strip().lower())
+
+
+def _strip_quality_suffix(col_name):
+    return re.sub(r'\s+quality\s*$', '', str(col_name), flags=re.IGNORECASE).strip()
+
+
+def detect_suspicious_metadata(raw_df, numeric_columns):
+    """
+    Detect per-sensor suspicious flags from metadata columns when available.
+
+    Expected pattern (adaptive):
+      <sensor_name> + " Quality"
+    with values like Acceptable / Not set / etc.
+    """
+    suspicious_by_sensor = {c: pd.Series(False, index=raw_df.index) for c in numeric_columns}
+
+    quality_cols = [
+        c for c in raw_df.columns
+        if ('quality' in str(c).lower() and 'last modified' not in str(c).lower())
+    ]
+
+    if not quality_cols:
+        return suspicious_by_sensor, []
+
+    exact_sensor_lookup = {str(c): c for c in numeric_columns}
+    norm_sensor_lookup = {_norm_text(c): c for c in numeric_columns}
+
+    acceptable_tokens = {'acceptable', 'good', 'ok', 'valid', 'pass', 'passed'}
+    unknown_or_bad_tokens = {
+        '', 'nan', 'none', 'null', 'na', 'n/a',
+        'not set', 'suspect', 'suspicious', 'invalid', 'rejected', 'bad', 'poor',
+        'fail', 'failed', 'error'
+    }
+
+    used_quality_cols = []
+
+    for qcol in quality_cols:
+        sensor_guess = _strip_quality_suffix(qcol)
+
+        sensor_col = exact_sensor_lookup.get(sensor_guess)
+        if sensor_col is None:
+            sensor_col = norm_sensor_lookup.get(_norm_text(sensor_guess))
+        if sensor_col is None:
+            continue
+
+        qraw = raw_df[qcol]
+        qnorm = qraw.astype(str).map(_norm_text)
+
+        is_acceptable = qnorm.isin(acceptable_tokens)
+        is_unknown_or_bad = qraw.isna() | qnorm.isin(unknown_or_bad_tokens)
+        suspicious = (~is_acceptable) | is_unknown_or_bad
+
+        suspicious_by_sensor[sensor_col] = suspicious_by_sensor[sensor_col] | suspicious
+        used_quality_cols.append(qcol)
+
+    return suspicious_by_sensor, used_quality_cols
+
+
+def compute_error_metrics(y_true, y_pred, y_std=None):
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    mask = np.isfinite(y_true) & np.isfinite(y_pred)
+    if mask.sum() == 0:
+        return {
+            'n': 0,
+            'mae': np.nan,
+            'rmse': np.nan,
+            'bias': np.nan,
+            'r2_like': np.nan,
+            'coverage95': np.nan,
+            'mean95width': np.nan
+        }
+
+    y_true = y_true[mask]
+    y_pred = y_pred[mask]
+    residuals = y_true - y_pred
+
+    mae = float(np.mean(np.abs(residuals)))
+    rmse = float(np.sqrt(np.mean(residuals ** 2)))
+    bias = float(np.mean(residuals))
+    var_true = float(np.var(y_true))
+    r2_like = float(1.0 - (np.var(residuals) / var_true)) if var_true > 0 else np.nan
+
+    coverage95 = np.nan
+    mean95width = np.nan
+    if y_std is not None:
+        y_std = np.asarray(y_std, dtype=float)[mask]
+        if len(y_std):
+            lower = y_pred - 1.96 * y_std
+            upper = y_pred + 1.96 * y_std
+            coverage95 = float(np.mean((y_true >= lower) & (y_true <= upper)))
+            mean95width = float(np.nanmean(upper - lower))
+
+    return {
+        'n': int(len(y_true)),
+        'mae': mae,
+        'rmse': rmse,
+        'bias': bias,
+        'r2_like': r2_like,
+        'coverage95': coverage95,
+        'mean95width': mean95width
+    }
+
+
+def compute_lagged_metric(target, driver, max_lag, method='pearson', embedding_dim=3, tau=1):
+    """
+    Returns DataFrame with lag and metric value.
+    Positive lag means driver leads target by `lag` timesteps.
+    """
+    rows = []
+    target = np.asarray(target, dtype=float)
+    driver = np.asarray(driver, dtype=float)
+
+    for lag in range(-max_lag, max_lag + 1):
+        if lag > 0:
+            y = target[lag:]
+            x = driver[:-lag]
+        elif lag < 0:
+            y = target[:lag]
+            x = driver[-lag:]
+        else:
+            y = target
+            x = driver
+
+        mask = np.isfinite(x) & np.isfinite(y)
+        if mask.sum() < 5:
+            rows.append({'lag': lag, 'value': np.nan})
+            continue
+
+        x_use = x[mask]
+        y_use = y[mask]
+
+        try:
+            if method == 'spearman':
+                val = float(spearmanr(x_use, y_use).correlation)
+            elif method == 'ccm':
+                val = float(compute_ccm_correlation(y_use, x_use, embedding_dim=embedding_dim, tau=tau))
+            elif method == 'smap':
+                val = float(compute_smap_correlation(y_use, x_use, embedding_dim=embedding_dim, tau=tau))
+            else:
+                val = float(pearsonr(x_use, y_use)[0])
+        except Exception:
+            val = np.nan
+
+        rows.append({'lag': lag, 'value': val})
+
+    return pd.DataFrame(rows)
 
 
 # ============================================================
@@ -367,24 +673,94 @@ def hyperparameterSearch(column, df, attractionJson, baseConfig, searchOpts):
 
 st.set_page_config(layout="wide")
 st.title("Attractors/ML Dashboard")
-dataContainer = st.container(border=True)
-
-uploaded = dataContainer.file_uploader("Upload CSV", type=["csv"])
+uploaded = st.file_uploader("Upload CSV", type=["csv"])
 
 if uploaded:
-    
-    df = pd.read_csv(uploaded)
-    df = df.drop(columns=[c for c in df.columns if c.lower()=="datetime"], errors="ignore")
-    numericDf = df.select_dtypes(include=[np.number])
+    rawDf = pd.read_csv(uploaded)
+    timeAxis = parse_time_axis(rawDf)
+    if timeAxis is None:
+        timeAxis = pd.Series(np.arange(len(rawDf)), index=rawDf.index, name='index')
+
+    numericDfRaw = rawDf.select_dtypes(include=[np.number]).copy()
+    if numericDfRaw.empty:
+        st.error("No numeric columns found in the uploaded CSV.")
+        st.stop()
+
+    suspicious_map, quality_cols_used = detect_suspicious_metadata(rawDf, numericDfRaw.columns)
+
+    with st.sidebar.expander("QC Config", expanded=True):
+        st.caption("Configure quality-control handling for missing and suspicious values.")
+        metadata_found = len(quality_cols_used) > 0
+        use_quality_metadata = st.checkbox(
+            "Use metadata quality flags",
+            value=metadata_found,
+            help="If metadata quality columns are found (e.g., '<sensor> Quality'), values flagged as non-acceptable are treated as suspicious."
+        )
+        use_statistical_flags = st.checkbox(
+            "Add statistical suspicious flags (z-score)",
+            value=False,
+            help="Marks unusually large absolute z-scores in each sensor as suspicious."
+        )
+        zscore_threshold = st.slider(
+            "Z-score threshold",
+            2.0,
+            8.0,
+            4.0,
+            step=0.1,
+            help="Only used when statistical suspicious flags are enabled."
+        )
+        treat_suspicious_as_missing = st.checkbox(
+            "Treat suspicious values as missing for analyses and ML",
+            value=metadata_found,
+            help="When enabled, suspicious observations are masked to NaN before downstream analysis and model training."
+        )
+
+    suspiciousMaskDf = pd.DataFrame(False, index=numericDfRaw.index, columns=numericDfRaw.columns)
+    if use_quality_metadata and quality_cols_used:
+        for col in numericDfRaw.columns:
+            suspiciousMaskDf[col] = suspiciousMaskDf[col] | suspicious_map.get(col, False)
+
+    if use_statistical_flags:
+        for col in numericDfRaw.columns:
+            s = numericDfRaw[col].astype(float)
+            std = float(s.std(skipna=True))
+            if std > 0 and np.isfinite(std):
+                z = (s - s.mean(skipna=True)) / std
+                suspiciousMaskDf[col] = suspiciousMaskDf[col] | (z.abs() > float(zscore_threshold)).fillna(False)
+
+    numericDf = numericDfRaw.copy()
+    if treat_suspicious_as_missing:
+        numericDf = numericDf.mask(suspiciousMaskDf)
+
+    # Main dashboard tabs
+    dataContainer, attractorContainer, MLContainer = st.tabs([
+        "QC / Data",
+        "Attractors",
+        "ML / Forecast",
+    ])
 
     # ========================================================
     # -------------------- DATA PREVIEW ----------------------
     # ========================================================
 
-    dataContainer.subheader("Data Preview",help="First few rows of the numeric data. This gives a quick look at the values and can help identify any immediate issues such as incorrect parsing, unexpected missing values, or outliers. Note that only numeric columns are shown here since the attractor analysis relies on correlation metrics that require numeric data.")
+    dataContainer.subheader("Data Preview", help="First few rows of the numeric data after current QC settings. Values marked suspicious can optionally be treated as missing.")
     dataContainer.dataframe(numericDf.head())
 
-    dataContainer.subheader("Missing Values per Column",help="Count of missing values in each column. High counts may indicate issues with data collection or the need for imputation strategies. Consider dropping columns with excessive missingness or using imputation techniques to fill in missing values based on the nature of the data and the analysis goals.")
+    qc_summary = pd.DataFrame({
+        'column': numericDfRaw.columns,
+        'raw_missing': numericDfRaw.isna().sum().values,
+        'suspicious_count': suspiciousMaskDf.sum().values,
+        'post_qc_missing': numericDf.isna().sum().values
+    })
+    dataContainer.subheader("QC Summary by Sensor", help="Per-sensor counts of raw missing values, suspicious values, and missing values after applying current QC settings.")
+    dataContainer.dataframe(qc_summary, use_container_width=True)
+
+    if quality_cols_used:
+        dataContainer.caption(f"Detected quality metadata columns: {len(quality_cols_used)}")
+    else:
+        dataContainer.info("No quality metadata columns detected. QC will rely on missingness and optional statistical flags.")
+
+    dataContainer.subheader("Missing Values per Column", help="Count of missing values per sensor after current QC settings.")
     missing_sort_mode = dataContainer.radio(
         "Missing-value bar order",
         ["Dataframe order", "Ascending missing count"],
@@ -403,35 +779,283 @@ if uploaded:
     })
     fig_missing_bar = px.bar(missing_plot_df, x='column', y='missing_count', labels={'column': 'Column', 'missing_count': 'Missing Values'})
     fig_missing_bar.update_xaxes(categoryorder='array', categoryarray=missing_plot_df['column'].tolist())
-    dataContainer.plotly_chart(fig_missing_bar, use_container_width=True)
+    dataContainer.plotly_chart(fig_missing_bar, use_container_width=True, key='missing_bar')
 
-    dataContainer.subheader("Missing Data Heatmap",help="Visual representation of missing values in the dataset. Each row corresponds to a record and each column corresponds to a feature. Yellow indicates missing values, while blue indicates present values. This can help identify patterns of missingness, such as entire columns or rows that are missing data, which may inform data cleaning or imputation strategies.")
+    dataContainer.subheader("Suspicious Values per Column", help="Count of suspicious values identified from metadata and optional statistical flags.")
+    suspicious_counts = suspiciousMaskDf.sum()
+    suspicious_plot_df = pd.DataFrame({
+        'column': suspicious_counts.index,
+        'suspicious_count': suspicious_counts.values
+    })
+    fig_suspicious_bar = px.bar(
+        suspicious_plot_df,
+        x='column',
+        y='suspicious_count',
+        labels={'column': 'Column', 'suspicious_count': 'Suspicious Values'}
+    )
+    fig_suspicious_bar.update_xaxes(categoryorder='array', categoryarray=suspicious_plot_df['column'].tolist())
+    dataContainer.plotly_chart(fig_suspicious_bar, use_container_width=True, key='suspicious_bar')
+
+    dataContainer.subheader("Missing Data Heatmap", help="Visual representation of missing values after applying current QC settings.")
     fig_missing = px.imshow(numericDf.isna(), aspect="auto")
-    dataContainer.plotly_chart(fig_missing)
+    dataContainer.plotly_chart(fig_missing, key='missing_heatmap')
+
+    dataContainer.subheader("Suspicious Data Heatmap", help="Visual representation of suspicious flags per row/column. Yellow indicates suspicious observations.")
+    fig_susp = px.imshow(suspiciousMaskDf, aspect="auto")
+    dataContainer.plotly_chart(fig_susp, key='suspicious_heatmap')
+
+    dataContainer.subheader("Interactive QC Explorer", help="Interactive, linked view of selected sensors over time with suspicious and missing observations highlighted.")
+    qc_cols = dataContainer.multiselect(
+        "Sensors to inspect",
+        options=numericDf.columns.tolist(),
+        default=numericDf.columns[:min(3, len(numericDf.columns))].tolist(),
+        key='qc_explorer_columns'
+    )
+    qc_max_points = dataContainer.slider(
+        "Max points shown",
+        500,
+        min(50000, max(500, len(numericDf))),
+        min(8000, len(numericDf)),
+        step=500,
+        key='qc_max_points'
+    )
+    if qc_cols:
+        step = max(1, int(np.ceil(len(numericDf) / qc_max_points)))
+        sample_idx = np.arange(0, len(numericDf), step)
+        for col in qc_cols:
+            qc_plot_df = pd.DataFrame({
+                'x': timeAxis.iloc[sample_idx].values,
+                'value': numericDf[col].iloc[sample_idx].values,
+                'is_suspicious': suspiciousMaskDf[col].iloc[sample_idx].values,
+                'is_missing': numericDf[col].iloc[sample_idx].isna().values
+            })
+            fig_qc = go.Figure()
+            fig_qc.add_trace(go.Scatter(
+                x=qc_plot_df['x'],
+                y=qc_plot_df['value'],
+                mode='lines',
+                name='Series',
+                line=dict(color='steelblue', width=1.6)
+            ))
+            marked = qc_plot_df[(qc_plot_df['is_suspicious']) | (qc_plot_df['is_missing'])]
+            if not marked.empty:
+                fig_qc.add_trace(go.Scatter(
+                    x=marked['x'],
+                    y=marked['value'],
+                    mode='markers',
+                    name='Suspicious/Missing',
+                    marker=dict(color='crimson', size=5, opacity=0.75)
+                ))
+            fig_qc.update_layout(
+                title=f"QC Explorer: {col}",
+                xaxis_title="Time",
+                yaxis_title=col,
+                xaxis=dict(rangeslider=dict(visible=True))
+            )
+            dataContainer.plotly_chart(fig_qc, use_container_width=True, key=f'qc_{col}')
 
     # Attractor controls (place before correlation computation so they affect method)
     with st.sidebar.expander("Attractor Config", expanded=True):
         st.caption("Configure how attractor drivers are selected based on correlation metrics and thresholds.")
-        attractionMetric = st.selectbox("Attraction Metric", ["Pearson", "Spearman"], key='attractionMetric', help="Correlation method: 'Pearson' captures linear relationships, while 'Spearman' captures monotonic relationships based on rank. Spearman is more robust to outliers and non-linear but monotonic patterns.")
-        thresholdMetric = st.selectbox("Threshold Metric", ["Rank", "Absolute"], key='thresholdMetric', help="Thresholding method: 'Rank' selects the top (1 - threshold) fraction of drivers based on their coefficient ranking, while 'Absolute' selects drivers whose coefficients exceed a fixed value. Rank is adaptive to the distribution of coefficients, while Absolute applies a fixed cutoff regardless of distribution.")
-        attractionThreshold = st.slider("Attraction Threshold", 0.0, 1.0, 0.8, help="Threshold value for selecting drivers based on the chosen Threshold Metric. In 'Rank' mode, this represents the fraction of top drivers to select (e.g., 0.8 means select the top 20%). In 'Absolute' mode, this is the minimum coefficient value a driver must have to be selected.")
-
-    # ========================================================
-    # --------------- ATTRACTOR CALCULATION ------------------
-    attractorContainer = st.container(border=True)
-    # ========================================================
         
+        correlation_method = st.selectbox(
+            "Correlation Method",
+            ["Pearson", "Spearman", "CCM", "S-Map"],
+            key='correlationMethod',
+            help="Choose the method for calculating correlations: 'Pearson' for linear relationships, 'Spearman' for rank-based (robust to outliers), 'CCM' for dynamic causality via time-delay embedding, or 'S-Map' for nonlinear relationships."
+        )
+        
+        # Additional settings for CCM/S-Map
+        if correlation_method in ["CCM", "S-Map"]:
+            embedding_dim = st.slider(
+                "Embedding Dimension",
+                1, 10, 3,
+                help="Dimension of the time-delay embedding for CCM/S-Map. Higher values capture more complexity but require more data."
+            )
+            tau = st.slider(
+                "Time Lag (tau)",
+                1, 10, 1,
+                help="Time delay for constructing embedding vectors. Larger values capture slower dynamics."
+            )
+        else:
+            embedding_dim = 3
+            tau = 1
+        
+        # Store in a session variable for consistency
+        if 'selected_correlation_method' not in st.session_state:
+            st.session_state['selected_correlation_method'] = correlation_method
+        if 'embedding_dim' not in st.session_state:
+            st.session_state['embedding_dim'] = embedding_dim
+        if 'tau' not in st.session_state:
+            st.session_state['tau'] = tau
+        
+        thresholdMetric = st.selectbox(
+            "Threshold Metric",
+            ["Rank", "Absolute"],
+            key='thresholdMetric',
+            help="Thresholding method: 'Rank' selects the top (1 - threshold) fraction of drivers based on their coefficient ranking, while 'Absolute' selects drivers whose coefficients exceed a fixed value. Rank is adaptive to the distribution of coefficients, while Absolute applies a fixed cutoff regardless of distribution."
+        )
+        attractionThreshold = st.slider(
+            "Attraction Threshold",
+            0.0, 1.0, 0.8,
+            help="Threshold value for selecting drivers based on the chosen Threshold Metric. In 'Rank' mode, this represents the fraction of top drivers to select (e.g., 0.8 means select the top 20%). In 'Absolute' mode, this is the minimum coefficient value a driver must have to be selected."
+        )
+
+    attractorContainer.subheader("Correlation Analysis",help="Correlation analysis using the selected method. Heatmap visualization of pairwise relationships between features. The chosen correlation method (Pearson, Spearman, CCM, or S-Map) determines how relationships are calculated.")
     
-    attractorContainer.subheader("Correlation Heatmap",help="Correlation matrix of numeric features based on the selected Attraction Metric. This heatmap visualizes the pairwise relationships between features, where values close to 1 or -1 indicate strong positive or negative correlations, respectively. The selected Attraction Metric (Pearson or Spearman) determines how these correlations are calculated, which in turn affects the identification of attractor drivers for the predictive modeling.")
-    # compute correlation according to selected metric
+    # Compute correlation according to selected method
     try:
-        corr_matrix = numericDf.corr(method='spearman') if attractionMetric == 'Spearman' else numericDf.corr()
-    except Exception:
-        corr_matrix = numericDf.corr()
+        method_key = correlation_method.lower()
+        corr_matrix = compute_correlation_matrix(
+            numericDf,
+            method=method_key,
+            embedding_dim=embedding_dim,
+            tau=tau
+        )
+    except Exception as e:
+        st.warning(f"Error computing {correlation_method} correlation: {e}. Falling back to Pearson.")
+        corr_matrix = numericDf.corr(method='pearson')
+    
+    # Show current method being used
+    attractorContainer.write(f"**Current Method:** {correlation_method}")
+    
+    # Display heatmap
     fig_corr = px.imshow(corr_matrix, text_auto=False, width=800, height=800)
     fig_corr.update_xaxes(showticklabels=False)
     fig_corr.update_yaxes(showticklabels=False)
-    attractorContainer.plotly_chart(fig_corr)
+    attractorContainer.plotly_chart(fig_corr, key='corr_heatmap')
+
+    # ---- Causality Visual (Directed) ----
+    attractorContainer.subheader("Causality Network (Directed)", help="Directed visual based on asymmetric CCM/S-Map mapping skill. Edge A→B indicates A helps reconstruct/predict B above threshold.")
+    causality_method = attractorContainer.selectbox(
+        "Causality method",
+        ["CCM", "S-Map"],
+        key='causality_method_directed'
+    )
+    causality_threshold = attractorContainer.slider(
+        "Causality edge threshold",
+        0.0,
+        1.0,
+        0.35,
+        key='causality_edge_threshold'
+    )
+    if attractorContainer.button("Compute Directed Causality", key='compute_directed_causality'):
+        directed_mat = compute_correlation_matrix(
+            numericDf,
+            method=causality_method.lower(),
+            embedding_dim=embedding_dim,
+            tau=tau
+        )
+
+        d_nodes = directed_mat.columns.tolist()
+        edges = []
+        for src in d_nodes:
+            for tgt in d_nodes:
+                if src == tgt:
+                    continue
+                val = float(directed_mat.loc[tgt, src])
+                if np.isfinite(val) and val >= causality_threshold:
+                    edges.append((src, tgt, val))
+
+        if edges:
+            g = graphviz.Digraph()
+            g.attr(rankdir='LR')
+            for n in d_nodes:
+                g.node(n)
+            for src, tgt, val in sorted(edges, key=lambda x: x[2], reverse=True)[:200]:
+                g.edge(src, tgt, label=f"{val:.2f}")
+            attractorContainer.graphviz_chart(g)
+        else:
+            attractorContainer.info("No directed edges exceed the selected threshold.")
+
+    # ---- Lagged Correlation and Causality Section ----
+    attractorContainer.subheader("Lagged Correlation and Causality", help="Evaluate how relationships change across lead/lag offsets. Positive lag means driver leads target.")
+    lag_target = attractorContainer.selectbox("Lag analysis target", numericDf.columns.tolist(), key='lag_target')
+    lag_driver = attractorContainer.selectbox("Lag analysis driver", numericDf.columns.tolist(), key='lag_driver')
+    lag_method = attractorContainer.selectbox(
+        "Lagged metric",
+        ["Pearson", "Spearman", "CCM", "S-Map"],
+        key='lag_metric_method'
+    )
+    max_lag = attractorContainer.slider("Max lag (timesteps)", 1, 240, 48, key='max_lag_steps')
+
+    lag_df = compute_lagged_metric(
+        target=numericDf[lag_target].values,
+        driver=numericDf[lag_driver].values,
+        max_lag=max_lag,
+        method=lag_method.lower(),
+        embedding_dim=embedding_dim,
+        tau=tau
+    )
+    lag_fig = px.line(lag_df, x='lag', y='value', markers=True, title=f"Lag profile: {lag_driver} → {lag_target} ({lag_method})")
+    lag_fig.add_vline(x=0, line_dash='dash', line_color='gray')
+    attractorContainer.plotly_chart(lag_fig, use_container_width=True, key='lag_profile')
+
+    # ---- Algorithm Comparison Section ----
+    attractorContainer.subheader("Compare Correlation Algorithms", help="Side-by-side comparison of different correlation methods. This shows how different algorithms identify relationships in the same data, helping validate findings across methods.")
+    
+    compare_methods = attractorContainer.multiselect(
+        "Methods to Compare",
+        ["Pearson", "Spearman", "CCM", "S-Map"],
+        default=["Pearson", "Spearman"],
+        key='compare_methods'
+    )
+    
+    if compare_methods:
+        if attractorContainer.button("Compute Comparison", key='compute_comparison'):
+            comparison_results = {}
+            progress_placeholder = attractorContainer.empty()
+            
+            for idx, method_name in enumerate(compare_methods):
+                progress_placeholder.progress((idx) / len(compare_methods))
+                method_lower = method_name.lower()
+                try:
+                    comp_corr = compute_correlation_matrix(
+                        numericDf,
+                        method=method_lower,
+                        embedding_dim=embedding_dim,
+                        tau=tau
+                    )
+                    comparison_results[method_name] = comp_corr
+                except Exception as e:
+                    st.warning(f"Error with {method_name}: {e}")
+            
+            progress_placeholder.progress(1.0)
+            
+            if comparison_results:
+                # Create tabs for each method
+                comparison_tabs = attractorContainer.tabs(compare_methods)
+                
+                for tab, method_name in zip(comparison_tabs, compare_methods):
+                    if method_name in comparison_results:
+                        corr_data = comparison_results[method_name]
+                        fig = px.imshow(corr_data, text_auto=False, width=800, height=800,
+                                       title=f"{method_name} Correlation Matrix")
+                        fig.update_xaxes(showticklabels=False)
+                        fig.update_yaxes(showticklabels=False)
+                        tab.plotly_chart(fig, use_container_width=True, key=f'comp_{method_name}')
+                
+                # Statistics comparison
+                with attractorContainer.expander("Algorithm Statistics", expanded=False):
+                    stats_data = []
+                    for method_name, corr_df in comparison_results.items():
+                        # Get upper triangle values (excluding diagonal)
+                        mask = np.triu(np.ones_like(corr_df, dtype=bool), k=1)
+                        values = corr_df.values[mask]
+                        values = values[~np.isnan(values)]
+                        
+                        stats_data.append({
+                            'Method': method_name,
+                            'Mean Correlation': np.mean(values) if len(values) > 0 else 0,
+                            'Std Dev': np.std(values) if len(values) > 0 else 0,
+                            'Min': np.min(values) if len(values) > 0 else 0,
+                            'Max': np.max(values) if len(values) > 0 else 0,
+                            'Median': np.median(values) if len(values) > 0 else 0,
+                        })
+                    
+                    stats_df = pd.DataFrame(stats_data)
+                    st.dataframe(stats_df, use_container_width=True)
+    
     results = []
     for c1, c2 in itertools.combinations(numericDf.columns, 2):
         results.append({
@@ -535,7 +1159,7 @@ if uploaded:
             plot_bgcolor='white',
             margin=dict(l=20, r=20, t=60, b=20)
         )
-        attractorContainer.plotly_chart(fig_rel, use_container_width=True)
+        attractorContainer.plotly_chart(fig_rel, use_container_width=True, key='chord_diagram')
     else:
         attractorContainer.info("No non-zero relationships available to plot.")
     
@@ -571,8 +1195,65 @@ if uploaded:
         fig_hist.add_vline(x=cutoff_val, line_dash='dash', line_color='red', annotation_text='Cutoff', annotation_position='top right')
     except Exception:
         pass
-    attractorContainer.plotly_chart(fig_hist)
+    attractorContainer.plotly_chart(fig_hist, key='hist_coeff')
     attractorContainer.caption(summary_text)
+
+    # ---- Rolling Summaries (Feature 13) ----
+    attractorContainer.subheader("Rolling Summaries Over Time", help="Moving-window mean and variance diagnostics for selected sensors.")
+    rolling_col = attractorContainer.selectbox("Rolling summary sensor", numericDf.columns.tolist(), key='rolling_summary_col')
+    rolling_window = attractorContainer.slider("Rolling window size", 5, 1000, 96, key='rolling_window_size')
+
+    rolling_df = pd.DataFrame({
+        'x': timeAxis.values,
+        'value': numericDf[rolling_col].values
+    })
+    rolling_df['rolling_mean'] = rolling_df['value'].rolling(rolling_window, min_periods=max(2, rolling_window // 4)).mean()
+    rolling_df['rolling_var'] = rolling_df['value'].rolling(rolling_window, min_periods=max(2, rolling_window // 4)).var()
+
+    fig_roll_mean = go.Figure()
+    fig_roll_mean.add_trace(go.Scatter(x=rolling_df['x'], y=rolling_df['value'], mode='lines', name='Observed', line=dict(color='lightsteelblue', width=1)))
+    fig_roll_mean.add_trace(go.Scatter(x=rolling_df['x'], y=rolling_df['rolling_mean'], mode='lines', name='Rolling Mean', line=dict(color='navy', width=2)))
+    fig_roll_mean.update_layout(title=f"Rolling Mean ({rolling_window}) — {rolling_col}", xaxis_title='Time', yaxis_title=rolling_col)
+    attractorContainer.plotly_chart(fig_roll_mean, use_container_width=True, key='roll_mean')
+
+    fig_roll_var = go.Figure()
+    fig_roll_var.add_trace(go.Scatter(x=rolling_df['x'], y=rolling_df['rolling_var'], mode='lines', name='Rolling Variance', line=dict(color='darkorange', width=2)))
+    fig_roll_var.update_layout(title=f"Rolling Variance ({rolling_window}) — {rolling_col}", xaxis_title='Time', yaxis_title='Variance')
+    attractorContainer.plotly_chart(fig_roll_var, use_container_width=True, key='roll_var')
+
+    # ---- Extremes Over Time (Feature 14) ----
+    attractorContainer.subheader("Extremes Over Time", help="Counts of extreme values over time under user-defined thresholds.")
+    extreme_col = attractorContainer.selectbox("Extremes sensor", numericDf.columns.tolist(), key='extreme_col')
+    extreme_mode = attractorContainer.radio("Threshold type", ["Quantile", "Absolute"], horizontal=True, key='extreme_mode')
+    extreme_window = attractorContainer.slider("Extreme count window", 5, 1000, 96, key='extreme_window')
+
+    extreme_series = numericDf[extreme_col].astype(float)
+    threshold_specs = []
+    if extreme_mode == "Quantile":
+        q_choices = attractorContainer.multiselect("Quantiles", [0.9, 0.95, 0.975, 0.99], default=[0.95, 0.99], key='extreme_quantiles')
+        threshold_specs = [(f"q{int(q*1000)/10:g}", float(extreme_series.quantile(q))) for q in q_choices]
+    else:
+        abs_thr = attractorContainer.number_input("Absolute threshold", value=float(np.nanmean(extreme_series) + 2 * np.nanstd(extreme_series)))
+        threshold_specs = [("absolute", float(abs_thr))]
+
+    if threshold_specs:
+        extreme_plot = pd.DataFrame({'x': timeAxis.values})
+        summary_rows = []
+        fig_ext = go.Figure()
+        for lbl, thr in threshold_specs:
+            mask_ext = (extreme_series > thr).fillna(False).astype(int)
+            rolling_count = mask_ext.rolling(extreme_window, min_periods=1).sum()
+            extreme_plot[lbl] = rolling_count.values
+            fig_ext.add_trace(go.Scatter(x=extreme_plot['x'], y=extreme_plot[lbl], mode='lines', name=f"{lbl} (> {thr:.3g})"))
+            summary_rows.append({'threshold': lbl, 'value': thr, 'total_extremes': int(mask_ext.sum())})
+
+        fig_ext.update_layout(
+            title=f"Rolling Extreme Counts ({extreme_window}) — {extreme_col}",
+            xaxis_title='Time',
+            yaxis_title='Extreme count in window'
+        )
+        attractorContainer.plotly_chart(fig_ext, use_container_width=True, key='extremes')
+        attractorContainer.dataframe(pd.DataFrame(summary_rows), use_container_width=True)
 
     # ========================================================
     # ---------------- MODEL CONFIGURATION -------------------
@@ -644,7 +1325,9 @@ if uploaded:
         "numLayers": num_layers,
         "dropout": dropout,
         "bidirectional": bidirectional,
-        "attractionMetric": attractionMetric,
+        "correlationMethod": correlation_method,
+        "embeddingDim": embedding_dim,
+        "tau": tau,
         "thresholdMetric": thresholdMetric,
         "attractionThreshold": attractionThreshold,
         "learningRate": learning_rate,
@@ -792,12 +1475,6 @@ if uploaded:
                 st.session_state['layer_configs'] = loaded.get('layer_configs', st.session_state.get('layer_configs', []))
                 # attempt to set globals (won't rewrite widgets state, but provide feedback)
                 st.success(f"Loaded {selectedCfg}")
-    # ====================================================
-    # ------------- Real-Time NN Diagram -----------------
-    MLContainer = st.container(border=True)
-    # ====================================================
-    
-
     MLContainer.subheader("Neural Network Architecture",help="Visualization of the neural network architecture based on the current configuration. This diagram updates in real-time as you modify the model settings, including the number of layers, hidden sizes, dropout rates, and bidirectionality. Each layer box displays its type and parameters, and arrows indicate the flow of data from input to output.")
 
     directionMultiplier = 2 if bidirectional else 1
@@ -970,7 +1647,7 @@ if uploaded:
                     height=580,
                     coloraxis_showscale=(highlight_idx is None)
                 )
-                MLContainer.plotly_chart(fig_parallel, use_container_width=True)
+                MLContainer.plotly_chart(fig_parallel, use_container_width=True, key='parallel_coords')
 
                 if optimizer_map:
                     optimizer_legend = ", ".join([f"{v} = {k}" for k, v in optimizer_map.items()])
@@ -1013,7 +1690,7 @@ if uploaded:
             # ensure y-axis always includes zero as the baseline
             fig.update_yaxes(rangemode='tozero')
 
-            MLContainer.plotly_chart(fig)
+            MLContainer.plotly_chart(fig, key=f"train_curve_{res['column']}")
 
             MLContainer.write(f"Drivers Used:")
             MLContainer.write(res['drivers'])
@@ -1127,6 +1804,12 @@ if uploaded:
                         infilled_indices.append(i)
                 dfFilled[column] = y_vals
 
+                in_sample_mask = (~original_missing) & np.isfinite(pred_mean) & np.isfinite(numericDf[column].values)
+                in_sample_true = numericDf[column].values[in_sample_mask].astype(float)
+                in_sample_pred = pred_mean[in_sample_mask].astype(float)
+                in_sample_std = pred_std[in_sample_mask].astype(float)
+                in_sample_metrics = compute_error_metrics(in_sample_true, in_sample_pred, in_sample_std)
+
                 infill_plots[column] = {
                     'original':        numericDf[column].values.copy().astype(float),
                     'filled':          y_vals,
@@ -1137,6 +1820,8 @@ if uploaded:
                     'drivers':         drivers,
                     'inputSize':       inputSize,
                     'other_cols':      other_cols,
+                    'in_sample_mask':  in_sample_mask,
+                    'in_sample_metrics': in_sample_metrics,
                 }
 
             # ---- Forecasting ----
@@ -1261,7 +1946,46 @@ if uploaded:
                     yaxis_title=column,
                     legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1)
                 )
-                MLContainer.plotly_chart(fig, use_container_width=True)
+                MLContainer.plotly_chart(fig, use_container_width=True, key=f'infill_{column}')
+
+                # In-sample diagnostics (Feature 2 + 17)
+                diag_mask = pdata.get('in_sample_mask')
+                diag_metrics = pdata.get('in_sample_metrics', {})
+                if diag_mask is not None and int(diag_metrics.get('n', 0)) > 0:
+                    with MLContainer.expander(f"In-sample diagnostics: {column}", expanded=False):
+                        metric_df = pd.DataFrame([diag_metrics])
+                        # st.dataframe(metric_df, use_container_width=True)
+
+                        obs_vals = np.asarray(pdata['original'])[diag_mask]
+                        pred_vals = np.asarray(pdata['pred_mean'])[diag_mask]
+                        std_vals = np.asarray(pdata['pred_std'])[diag_mask]
+                        # resid_vals = obs_vals - pred_vals
+                        x_diag = np.asarray(timeAxis)[diag_mask]
+
+                        fig_scatter = px.scatter(
+                            x=obs_vals,
+                            y=pred_vals,
+                            labels={'x': 'Observed', 'y': 'Predicted'},
+                            title=f"Observed vs Predicted ({column})"
+                        )
+                        min_v = np.nanmin([np.nanmin(obs_vals), np.nanmin(pred_vals)])
+                        max_v = np.nanmax([np.nanmax(obs_vals), np.nanmax(pred_vals)])
+                        fig_scatter.add_trace(go.Scatter(x=[min_v, max_v], y=[min_v, max_v], mode='lines', name='1:1', line=dict(color='gray', dash='dash')))
+                        st.plotly_chart(fig_scatter, use_container_width=True, key=f'diag_scatter_{column}')
+
+                        # fig_resid = go.Figure()
+                        # fig_resid.add_trace(go.Scatter(x=x_diag, y=resid_vals, mode='markers', name='Residuals', marker=dict(color='firebrick', size=4, opacity=0.6)))
+                        # fig_resid.update_layout(title=f"Residuals Over Time ({column})", xaxis_title='Time', yaxis_title='Observed - Predicted')
+                        # st.plotly_chart(fig_resid, use_container_width=True, key=f'diag_resid_{column}')
+
+                        # fig_hist_resid = px.histogram(resid_vals, nbins=40, title=f"Residual Distribution ({column})")
+                        # st.plotly_chart(fig_hist_resid, use_container_width=True, key=f'diag_hist_{column}')
+
+                        if np.isfinite(std_vals).any():
+                            fig_unc = go.Figure()
+                            fig_unc.add_trace(go.Scatter(x=x_diag, y=1.96 * std_vals, mode='lines', name='95% half-width', line=dict(color='purple')))
+                            fig_unc.update_layout(title=f"Predictive Uncertainty Over Time ({column})", xaxis_title='Time', yaxis_title='±1.96σ')
+                            st.plotly_chart(fig_unc, use_container_width=True, key=f'diag_unc_{column}')
 
         st.success("Infilled / Forecasted dataset ready.")
 
