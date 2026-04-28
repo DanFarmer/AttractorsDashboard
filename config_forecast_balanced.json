@@ -1,0 +1,43 @@
+{
+  "meta": {
+    "saved_at": "2026-04-28T00:00:00Z",
+    "name": "config_forecast_balanced"
+  },
+  "global": {
+    "hiddenSize": 64,
+    "num_layers": 3,
+    "dropout": 0.2,
+    "bidirectional": true,
+    "learning_rate": 0.0001,
+    "batch_size": 32,
+    "window": 48,
+    "epochs": 30,
+    "optimizer": "Adam",
+    "activation": "ReLU"
+  },
+  "layer_configs": [
+    {
+      "type": "Conv1D",
+      "hiddenSize": 64,
+      "dropout": 0.1,
+      "bidirectional": false,
+      "kernel_size": 5,
+      "activation": "ReLU"
+    },
+    {
+      "type": "LSTM",
+      "hiddenSize": 64,
+      "dropout": 0.2,
+      "bidirectional": true,
+      "kernel_size": 3
+    },
+    {
+      "type": "Dense",
+      "hiddenSize": 32,
+      "dropout": 0.0,
+      "bidirectional": false,
+      "kernel_size": 3,
+      "activation": "ReLU"
+    }
+  ]
+}

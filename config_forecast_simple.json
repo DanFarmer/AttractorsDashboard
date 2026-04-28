@@ -1,0 +1,35 @@
+{
+  "meta": {
+    "saved_at": "2026-04-28T00:00:00Z",
+    "name": "config_forecast_simple"
+  },
+  "global": {
+    "hiddenSize": 32,
+    "num_layers": 2,
+    "dropout": 0.1,
+    "bidirectional": false,
+    "learning_rate": 0.0003,
+    "batch_size": 32,
+    "window": 24,
+    "epochs": 25,
+    "optimizer": "Adam",
+    "activation": "ReLU"
+  },
+  "layer_configs": [
+    {
+      "type": "LSTM",
+      "hiddenSize": 32,
+      "dropout": 0.1,
+      "bidirectional": false,
+      "kernel_size": 3
+    },
+    {
+      "type": "Dense",
+      "hiddenSize": 16,
+      "dropout": 0.0,
+      "bidirectional": false,
+      "kernel_size": 3,
+      "activation": "ReLU"
+    }
+  ]
+}
