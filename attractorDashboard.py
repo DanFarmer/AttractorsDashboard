@@ -711,7 +711,7 @@ if uploaded:
         )
         treat_suspicious_as_missing = st.checkbox(
             "Treat suspicious values as missing for analyses and ML",
-            value=metadata_found,
+            value=False,
             help="When enabled, suspicious observations are masked to NaN before downstream analysis and model training."
         )
 
