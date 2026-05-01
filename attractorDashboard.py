@@ -80,7 +80,7 @@ class CustomLSTM(tf.keras.Model):
 
             # Map activation strings to Keras activations (None -> linear)
             act = None
-            if act_name in (None, 'None', 'linear'):
+            if act_name in (None, 'None', 'linear', 'Identity'):
                 act = None
             elif act_name == 'ReLU' or act_name == 'relu':
                 act = 'relu'
@@ -147,7 +147,6 @@ def createSequences(X, y, window):
             ys.append(y[i + window])
     return np.array(Xs), np.array(ys)
 
-
 def getSafeDevice():
     """Return a CUDA device if usable, otherwise fall back to CPU.
 
@@ -213,7 +212,6 @@ def compute_ccm_correlation(series1, series2, embedding_dim=3, tau=1):
     except Exception as e:
         return 0.0
 
-
 def compute_smap_correlation(series1, series2, embedding_dim=3, tau=1, theta=None):
     """
     Simplified S-Map (Sequential Locally-Weighted Simplex Mapping) correlation.
@@ -265,19 +263,18 @@ def compute_smap_correlation(series1, series2, embedding_dim=3, tau=1, theta=Non
     except Exception:
         return 0.0
 
-
 def compute_correlation_matrix(df, method='pearson', embedding_dim=3, tau=1):
     """
     Compute correlation matrix using specified method.
     
-    Methods: 'pearson', 'spearman', 'ccm', 'smap'
+    Methods: 'pearson', 'spearman', 'smap'
     """
     try:
         if method == 'pearson':
             return df.corr(method='pearson')
         elif method == 'spearman':
             return df.corr(method='spearman')
-        elif method in ('ccm', 'smap'):
+        elif method in ('smap'):
             # For CCM and S-Map, compute pairwise correlations
             n_cols = len(df.columns)
             corr_matrix = np.zeros((n_cols, n_cols))
@@ -303,7 +300,6 @@ def compute_correlation_matrix(df, method='pearson', embedding_dim=3, tau=1):
         # Fallback to pearson
         return df.corr(method='pearson')
 
-
 def parse_time_axis(df):
     """Best-effort datetime axis extraction; returns datetime Series or None."""
     # Prefer explicit datetime-like column names first
@@ -320,14 +316,11 @@ def parse_time_axis(df):
             continue
     return None
 
-
 def _norm_text(s):
     return re.sub(r'\s+', ' ', str(s).strip().lower())
 
-
 def _strip_quality_suffix(col_name):
     return re.sub(r'\s+quality\s*$', '', str(col_name), flags=re.IGNORECASE).strip()
-
 
 def detect_suspicious_metadata(raw_df, numeric_columns):
     """
@@ -380,7 +373,6 @@ def detect_suspicious_metadata(raw_df, numeric_columns):
 
     return suspicious_by_sensor, used_quality_cols
 
-
 def compute_error_metrics(y_true, y_pred, y_std=None):
     y_true = np.asarray(y_true, dtype=float)
     y_pred = np.asarray(y_pred, dtype=float)
@@ -425,7 +417,6 @@ def compute_error_metrics(y_true, y_pred, y_std=None):
         'coverage95': coverage95,
         'mean95width': mean95width
     }
-
 
 def compute_lagged_metric(target, driver, max_lag, method='pearson', embedding_dim=3, tau=1):
     """
@@ -546,7 +537,6 @@ def trainModelRemote(column, df, attractionJson, config):
         "drivers": drivers
     }
 
-
 def evaluateConfig(column, df, attractionJson, baseConfig, trialCfg, quickEpochs=5):
     """Train with trialCfg (overrides) for a few epochs and return final validation loss."""
     # Build merged config
@@ -616,7 +606,6 @@ def evaluateConfig(column, df, attractionJson, baseConfig, trialCfg, quickEpochs
         'modelParams': model_params
     }
 
-
 def hyperparameterSearch(column, df, attractionJson, baseConfig, searchOpts):
     """Simple random search over ranges in searchOpts; returns best trial and loss."""
     trials = int(searchOpts.get('trials', 10))
@@ -673,7 +662,11 @@ def hyperparameterSearch(column, df, attractionJson, baseConfig, searchOpts):
 
 st.set_page_config(layout="wide")
 st.title("Attractors/ML Dashboard")
-uploaded = st.file_uploader("Upload CSV", type=["csv"])
+upload_col1, upload_col2 = st.columns(2)
+with upload_col1:
+    uploaded = st.file_uploader("Upload CSV", type=["csv"])
+with upload_col2:
+    geojson_uploaded = st.file_uploader("Upload GeoJSON (optional)", type=["geojson", "json"], key="geojson_upload")
 
 if uploaded:
     rawDf = pd.read_csv(uploaded)
@@ -732,11 +725,119 @@ if uploaded:
     if treat_suspicious_as_missing:
         numericDf = numericDf.mask(suspiciousMaskDf)
 
+    # default_geojson_path = os.path.expanduser("~/Downloads/Farm_updated.geojson")
+
+    def _extract_catchment_id(column_name):
+        match = re.search(r'catchment\D*(\d+)', str(column_name), flags=re.IGNORECASE)
+        return int(match.group(1)) if match else None
+
+    def _load_geojson_source(source):
+        if source is None:
+            return None
+        if isinstance(source, str):
+            with open(source, "r", encoding="utf-8") as f:
+                return json.load(f)
+        return json.load(source)
+
+    def _geojson_bounds_and_center(geojson_data):
+        lons = []
+        lats = []
+
+        def _walk_coords(coords):
+            if isinstance(coords, (list, tuple)):
+                if len(coords) >= 2 and all(isinstance(v, (int, float, np.integer, np.floating)) for v in coords[:2]):
+                    lon, lat = float(coords[0]), float(coords[1])
+                    lons.append(lon)
+                    lats.append(lat)
+                else:
+                    for item in coords:
+                        _walk_coords(item)
+
+        for feature in geojson_data.get("features", []):
+            geometry = feature.get("geometry") or {}
+            _walk_coords(geometry.get("coordinates"))
+
+        if not lons or not lats:
+            return {"lat": 50.769006, "lon": -3.902555}, 12
+
+        center = {"lat": (min(lats) + max(lats)) / 2.0, "lon": (min(lons) + max(lons)) / 2.0}
+        span = max(max(lats) - min(lats), max(lons) - min(lons))
+        if span < 0.005:
+            zoom = 15
+        elif span < 0.02:
+            zoom = 14
+        elif span < 0.08:
+            zoom = 12
+        else:
+            zoom = 10
+        return center, zoom
+
+    def _build_linked_geojson_map(data_df, geojson_data, aggregation="latest"):
+        features = geojson_data.get("features", []) or []
+
+        # map catchment number -> list of matching CSV columns (support multiple columns per shape)
+        catchment_cols = {}
+        for col in data_df.columns:
+            cid = _extract_catchment_id(col)
+            if cid is not None:
+                catchment_cols.setdefault(cid, []).append(col)
+
+        linked_rows = []
+        catchment_to_columns = {}
+
+        for feature in features:
+            props = feature.get("properties") or {}
+            db_catch_id = props.get("DB_CatchID")
+            if db_catch_id is None:
+                continue
+
+            try:
+                db_catch_id_int = int(float(db_catch_id))
+            except Exception:
+                continue
+
+            cols = catchment_cols.get(db_catch_id_int, [])
+            if not cols:
+                continue
+
+            # compute aggregated value across linked columns
+            vals = []
+            for c in cols:
+                series = pd.to_numeric(data_df[c], errors="coerce")
+                if aggregation == "mean":
+                    vals.append(series.mean(skipna=True))
+                elif aggregation == "median":
+                    vals.append(series.median(skipna=True))
+                else:
+                    valid = series.dropna()
+                    vals.append(valid.iloc[-1] if len(valid) else np.nan)
+
+            # average across columns (ignoring all-nan)
+            try:
+                value = float(np.nanmean(vals))
+            except Exception:
+                value = np.nan
+
+            feature.setdefault("properties", {})["DB_CatchID"] = str(db_catch_id_int)
+            linked_rows.append({
+                "feature_id": str(db_catch_id_int),
+                "db_catch_id": db_catch_id_int,
+                "field_name": str(props.get("Field_Name", db_catch_id_int)),
+                "columns": cols,
+                "value": value,
+            })
+
+            catchment_to_columns[db_catch_id_int] = cols
+
+        linked_df = pd.DataFrame(linked_rows)
+        return linked_df, "properties.DB_CatchID", catchment_to_columns
+
     # Main dashboard tabs
-    dataContainer, attractorContainer, MLContainer = st.tabs([
+    dataContainer, attractorContainer, MLContainer, SpatialContainer = st.tabs([
         "QC / Data",
         "Attractors",
         "ML / Forecast",
+        "Spatial Analysis"
     ])
 
     # ========================================================
@@ -906,8 +1007,21 @@ if uploaded:
     # Compute correlation according to selected method
     try:
         method_key = correlation_method.lower()
+        # If a catchment is selected, restrict correlation to its linked columns
+        activeDf = numericDf
+        sel_opt = st.session_state.get('selected_catchment_option')
+        if sel_opt and 'catchment_to_columns' in st.session_state:
+            try:
+                sel_id = int(sel_opt.split('—')[0].strip())
+                cols = st.session_state.get('catchment_to_columns', {}).get(sel_id, [])
+                if cols:
+                    activeDf = numericDf[cols]
+                    attractorContainer.info(f"Filtering analysis to columns linked to catchment {sel_id}: {', '.join(cols)}")
+            except Exception:
+                pass
+
         corr_matrix = compute_correlation_matrix(
-            numericDf,
+            activeDf,
             method=method_key,
             embedding_dim=embedding_dim,
             tau=tau
@@ -916,65 +1030,13 @@ if uploaded:
         st.warning(f"Error computing {correlation_method} correlation: {e}. Falling back to Pearson.")
         corr_matrix = numericDf.corr(method='pearson')
     
-    # Show current method being used
-    attractorContainer.write(f"**Current Method:** {correlation_method}")
-    
-    # Display heatmap
-    fig_corr = px.imshow(corr_matrix, text_auto=False, width=800, height=800)
-    fig_corr.update_xaxes(showticklabels=False)
-    fig_corr.update_yaxes(showticklabels=False)
-    attractorContainer.plotly_chart(fig_corr, key='corr_heatmap')
-
-    # ---- Causality Visual (Directed) ----
-    attractorContainer.subheader("Causality Network (Directed)", help="Directed visual based on asymmetric CCM/S-Map mapping skill. Edge A→B indicates A helps reconstruct/predict B above threshold.")
-    causality_method = attractorContainer.selectbox(
-        "Causality method",
-        ["CCM", "S-Map"],
-        key='causality_method_directed'
-    )
-    causality_threshold = attractorContainer.slider(
-        "Causality edge threshold",
-        0.0,
-        1.0,
-        0.35,
-        key='causality_edge_threshold'
-    )
-    if attractorContainer.button("Compute Directed Causality", key='compute_directed_causality'):
-        directed_mat = compute_correlation_matrix(
-            numericDf,
-            method=causality_method.lower(),
-            embedding_dim=embedding_dim,
-            tau=tau
-        )
-
-        d_nodes = directed_mat.columns.tolist()
-        edges = []
-        for src in d_nodes:
-            for tgt in d_nodes:
-                if src == tgt:
-                    continue
-                val = float(directed_mat.loc[tgt, src])
-                if np.isfinite(val) and val >= causality_threshold:
-                    edges.append((src, tgt, val))
-
-        if edges:
-            g = graphviz.Digraph()
-            g.attr(rankdir='LR')
-            for n in d_nodes:
-                g.node(n)
-            for src, tgt, val in sorted(edges, key=lambda x: x[2], reverse=True)[:200]:
-                g.edge(src, tgt, label=f"{val:.2f}")
-            attractorContainer.graphviz_chart(g)
-        else:
-            attractorContainer.info("No directed edges exceed the selected threshold.")
-
     # ---- Lagged Correlation and Causality Section ----
     attractorContainer.subheader("Lagged Correlation and Causality", help="Evaluate how relationships change across lead/lag offsets. Positive lag means driver leads target.")
     lag_target = attractorContainer.selectbox("Lag analysis target", numericDf.columns.tolist(), key='lag_target')
     lag_driver = attractorContainer.selectbox("Lag analysis driver", numericDf.columns.tolist(), key='lag_driver')
     lag_method = attractorContainer.selectbox(
         "Lagged metric",
-        ["Pearson", "Spearman", "CCM", "S-Map"],
+        ["Pearson", "Spearman", "S-Map"],
         key='lag_metric_method'
     )
     max_lag = attractorContainer.slider("Max lag (timesteps)", 1, 240, 48, key='max_lag_steps')
@@ -987,7 +1049,13 @@ if uploaded:
         embedding_dim=embedding_dim,
         tau=tau
     )
-    lag_fig = px.line(lag_df, x='lag', y='value', markers=True, title=f"Lag profile: {lag_driver} → {lag_target} ({lag_method})")
+    if lag_df['lag'].iloc[lag_df['value'].idxmax()] > 0:
+        lag_interpretation = f"{lag_driver} leads {lag_target} by {lag_df['lag'].iloc[lag_df['value'].idxmax()]} timesteps."
+    elif lag_df['lag'].iloc[lag_df['value'].idxmax()] < 0:
+        lag_interpretation = f"{lag_driver} lags {lag_target} by {abs(lag_df['lag'].iloc[lag_df['value'].idxmax()])} timesteps."
+    else:
+        lag_interpretation = f"{lag_driver} and {lag_target} are most correlated at zero lag."
+    lag_fig = px.line(lag_df, x='lag', y='value', markers=True, title= lag_interpretation)
     lag_fig.add_vline(x=0, line_dash='dash', line_color='gray')
     attractorContainer.plotly_chart(lag_fig, use_container_width=True, key='lag_profile')
 
@@ -996,7 +1064,7 @@ if uploaded:
     
     compare_methods = attractorContainer.multiselect(
         "Methods to Compare",
-        ["Pearson", "Spearman", "CCM", "S-Map"],
+        ["Pearson", "Spearman", "S-Map"],
         default=["Pearson", "Spearman"],
         key='compare_methods'
     )
@@ -1057,7 +1125,8 @@ if uploaded:
                     st.dataframe(stats_df, use_container_width=True)
     
     results = []
-    for c1, c2 in itertools.combinations(numericDf.columns, 2):
+    cols_for_pairs = corr_matrix.columns.tolist()
+    for c1, c2 in itertools.combinations(cols_for_pairs, 2):
         results.append({
             "target_feature": c1,
             "driver": c2,
@@ -1277,6 +1346,102 @@ if uploaded:
             return default
         return g.get(camel, g.get(snake, default))
 
+    def _clamp(value, lo, hi):
+        try:
+            return max(lo, min(hi, value))
+        except Exception:
+            return lo
+
+    def _normalize_loaded_model_config(loaded_cfg):
+        """Return a session-state friendly config payload from a saved JSON file."""
+        loaded_global_cfg = loaded_cfg.get('global', {}) if loaded_cfg else {}
+
+        global_cfg = {
+            'hiddenSize': int(_clamp(_g(loaded_global_cfg, 'hiddenSize', 'hidden_size', 64), 16, 256)),
+            'numLayers': int(_clamp(_g(loaded_global_cfg, 'numLayers', 'num_layers', 2), 1, 8)),
+            'dropout': float(_clamp(_g(loaded_global_cfg, 'dropout', 'dropout', 0.2), 0.0, 0.5)),
+            'bidirectional': bool(_g(loaded_global_cfg, 'bidirectional', 'bidirectional', False)),
+            'learningRate': float(_g(loaded_global_cfg, 'learningRate', 'learning_rate', 1e-5)),
+            'batchSize': int(_clamp(_g(loaded_global_cfg, 'batchSize', 'batch_size', 32), 16, 128)),
+            'window': int(_clamp(_g(loaded_global_cfg, 'window', 'window', 20), 5, 50)),
+            'epochs': int(_clamp(_g(loaded_global_cfg, 'epochs', 'epochs', 10), 5, 50)),
+            'optimizer': _g(loaded_global_cfg, 'optimizer', 'optimizer', 'Adam'),
+            'activation': _g(loaded_global_cfg, 'activation', 'activation', 'ReLU'),
+        }
+
+        lr_options = [1e-1, 1e-2, 1e-3, 1e-4, 1e-5, 1e-6]
+        try:
+            global_cfg['learningRate'] = min(lr_options, key=lambda x: abs(float(x) - float(global_cfg['learningRate'])))
+        except Exception:
+            global_cfg['learningRate'] = 1e-5
+
+        if str(global_cfg['optimizer']) not in {'Adam', 'SGD'}:
+            global_cfg['optimizer'] = 'Adam'
+
+        act = str(global_cfg['activation']) if global_cfg['activation'] is not None else 'Identity'
+        if act.lower() in {'none', 'linear', 'identity'}:
+            global_cfg['activation'] = 'Identity'
+        elif act.lower() == 'tanh':
+            global_cfg['activation'] = 'Tanh'
+        else:
+            global_cfg['activation'] = 'ReLU'
+
+        layer_cfgs = list(loaded_cfg.get('layer_configs', []) or []) if loaded_cfg else []
+        if layer_cfgs:
+            num_layers = len(layer_cfgs)
+        else:
+            num_layers = global_cfg['numLayers']
+            layer_cfgs = [
+                {
+                    'type': 'LSTM',
+                    'hiddenSize': global_cfg['hiddenSize'],
+                    'dropout': global_cfg['dropout'],
+                    'bidirectional': global_cfg['bidirectional'],
+                    'kernel_size': 3,
+                    'activation': global_cfg['activation'],
+                }
+                for _ in range(num_layers)
+            ]
+
+        normalized_layers = []
+        for lc in layer_cfgs:
+            layer_type = lc.get('type', 'LSTM')
+            if layer_type not in {'LSTM', 'Conv1D', 'Dense'}:
+                layer_type = 'LSTM'
+            normalized_layers.append({
+                'type': layer_type,
+                'hiddenSize': int(_clamp(lc.get('hiddenSize', global_cfg['hiddenSize']), 4, 1024)),
+                'dropout': float(_clamp(lc.get('dropout', global_cfg['dropout']), 0.0, 0.9)),
+                'bidirectional': bool(lc.get('bidirectional', global_cfg['bidirectional'])),
+                'kernel_size': int(_clamp(lc.get('kernel_size', 3), 1, 11)),
+                'activation': lc.get('activation', global_cfg['activation']),
+            })
+
+        return global_cfg, normalized_layers
+
+    def _apply_model_config_to_state(loaded_cfg):
+        global_cfg, layer_cfgs = _normalize_loaded_model_config(loaded_cfg)
+        st.session_state['hiddenSize'] = global_cfg['hiddenSize']
+        st.session_state['numLayers'] = global_cfg['numLayers']
+        st.session_state['dropout'] = global_cfg['dropout']
+        st.session_state['bidirectional'] = global_cfg['bidirectional']
+        st.session_state['learningRate'] = global_cfg['learningRate']
+        st.session_state['batchSize'] = global_cfg['batchSize']
+        st.session_state['window'] = global_cfg['window']
+        st.session_state['epochs'] = global_cfg['epochs']
+        st.session_state['optimizer'] = global_cfg['optimizer']
+        st.session_state['activation'] = global_cfg['activation']
+        st.session_state['layer_configs'] = layer_cfgs
+
+        for i, lc in enumerate(layer_cfgs, start=1):
+            st.session_state[f'layer_type_{i}'] = lc.get('type', 'LSTM')
+            st.session_state[f'layer_units_{i}'] = int(_clamp(lc.get('hiddenSize', 32), 4, 1024))
+            st.session_state[f'layer_dropout_{i}'] = float(_clamp(lc.get('dropout', 0.0), 0.0, 0.9))
+            st.session_state[f'layer_bidir_{i}'] = bool(lc.get('bidirectional', False))
+            st.session_state[f'layer_kernel_{i}'] = int(_clamp(lc.get('kernel_size', 3), 1, 11))
+
+        st.session_state['layer_to_edit'] = 1
+
     loaded_global = default_cfg.get('global', {}) if default_cfg else {}
     # Map loaded values (support both camelCase and snake_case saved files)
     default_hidden = int(_g(loaded_global, 'hiddenSize', 'hidden_size', 64))
@@ -1294,12 +1459,20 @@ if uploaded:
     if default_cfg and 'layer_configs' in default_cfg and 'layer_configs' not in st.session_state:
         st.session_state['layer_configs'] = default_cfg.get('layer_configs', [])
 
+    # Apply any queued loaded config BEFORE model widgets are instantiated.
+    pending_loaded_cfg = st.session_state.pop('_pending_loaded_model_cfg', None)
+    pending_loaded_name = st.session_state.pop('_pending_loaded_model_name', None)
+    if pending_loaded_cfg is not None:
+        _apply_model_config_to_state(pending_loaded_cfg)
+        if pending_loaded_name:
+            st.session_state['_loaded_model_notice'] = f"Loaded {pending_loaded_name}"
+
     with st.sidebar.expander("Model Config", expanded=True):
         st.caption("Configure the neural network architecture and training parameters. You can also specify per-layer settings and perform auto-tuning for hyperparameter search.")
-        hiddenSize = st.slider("Hidden Size", 16, 256, default_hidden, help="Number of units/filters in LSTM/Conv layers (if uniform) or base size for layer configs.")
-        num_layers = st.number_input("Num Layers", 1, 8, default_num_layers, help="Number of layers in the model. If using uniform global settings, all layers will use the same hidden size, dropout, and bidirectionality. For per-layer customization, use the 'Per-layer Configuration' section below.")
-        dropout = st.slider("Dropout", 0.0, 0.5, default_dropout, help="Dropout rate for LSTM layers (if uniform) or base dropout for layer configs.")
-        bidirectional = st.checkbox("Bidirectional", value=default_bidir, help="Whether LSTM layers are bidirectional (if uniform) or base bidirectionality for layer configs.")
+        hiddenSize = st.slider("Hidden Size", 16, 256, default_hidden, key='hiddenSize', help="Number of units/filters in LSTM/Conv layers (if uniform) or base size for layer configs.")
+        num_layers = st.number_input("Num Layers", 1, 8, default_num_layers, key='numLayers', help="Number of layers in the model. If using uniform global settings, all layers will use the same hidden size, dropout, and bidirectionality. For per-layer customization, use the 'Per-layer Configuration' section below.")
+        dropout = st.slider("Dropout", 0.0, 0.5, default_dropout, key='dropout', help="Dropout rate for LSTM layers (if uniform) or base dropout for layer configs.")
+        bidirectional = st.checkbox("Bidirectional", value=default_bidir, key='bidirectional', help="Whether LSTM layers are bidirectional (if uniform) or base bidirectionality for layer configs.")
         _lr_options = [1e-1, 1e-2, 1e-3, 1e-4, 1e-5, 1e-6]
         _lr_labels = ["0.1", "0.01", "0.001", "0.0001", "0.00001", "0.000001"]
         _default_idx = _lr_options.index(1e-5) if 1e-5 in _lr_options else 2
@@ -1308,10 +1481,10 @@ if uploaded:
             _default_idx = _lr_options.index(default_lr)
         except Exception:
             _default_idx = _lr_options.index(1e-5) if 1e-5 in _lr_options else 2
-        learning_rate = float(st.selectbox('Learning Rate', options=_lr_options, format_func=lambda v: f"{v:.6g}", index=_default_idx, help="Choose learning rate by order-of-magnitude (significant figure)."))
-        batch_size = st.slider("Batch Size", 16, 128, default_batch, help="Batch size for training.")
-        window = st.slider("Window", 5, 50, default_window, help="Number of past timesteps to use as input for predicting the next value.")
-        epochs = st.slider("Epochs", 5, 50, default_epochs, help="Number of training epochs.")
+        learning_rate = float(st.selectbox('Learning Rate', options=_lr_options, format_func=lambda v: f"{v:.6g}", index=_default_idx, key='learningRate', help="Choose learning rate by order-of-magnitude (significant figure)."))
+        batch_size = st.slider("Batch Size", 16, 128, default_batch, key='batchSize', help="Batch size for training.")
+        window = st.slider("Window", 5, 50, default_window, key='window', help="Number of past timesteps to use as input for predicting the next value.")
+        epochs = st.slider("Epochs", 5, 50, default_epochs, key='epochs', help="Number of training epochs.")
         # optimizer and activation widgets have explicit keys; prepopulate session_state values so selection reflects defaults
         if 'optimizer' not in st.session_state:
             st.session_state['optimizer'] = default_optimizer
@@ -1353,20 +1526,25 @@ if uploaded:
             } for _ in range(num_layers)
         ]
 
+    if 'layer_to_edit' not in st.session_state:
+        st.session_state['layer_to_edit'] = 1
+    else:
+        st.session_state['layer_to_edit'] = int(_clamp(int(st.session_state['layer_to_edit']), 1, int(num_layers)))
+
     with st.sidebar.expander('Per-layer Configuration', expanded=False):
-        layer_idx = st.number_input('Layer to edit (1-indexed)', min_value=1, max_value=num_layers, value=1, step=1)
+        layer_idx = st.number_input('Layer to edit (1-indexed)', min_value=1, max_value=num_layers, value=st.session_state['layer_to_edit'], step=1, key='layer_to_edit')
         li = layer_idx - 1
 
         # show current values for selected layer
         cur = st.session_state['layer_configs'][li]
         # layer type
         new_type = st.selectbox(f'Layer Type (Layer {layer_idx})', ['LSTM', 'Conv1D', 'Dense'], index=['LSTM', 'Conv1D', 'Dense'].index(cur.get('type', 'LSTM')), key=f'layer_type_{layer_idx}',help="Type of layer: 'LSTM' for recurrent layers, 'Conv1D' for temporal convolutional layers, and 'Dense' for fully connected layers. This determines the operations performed at this layer and the meaning of other parameters (e.g., 'hiddenSize' is units for LSTM/Dense but filters for Conv1D).")
-        new_units = st.slider(f'Units/Filters (Layer {layer_idx})', 4, 1024, int(cur.get('hiddenSize', hiddenSize)), help="Number of units for LSTM/Dense or filters for Conv1D.")
-        new_dropout = st.slider(f'Dropout (Layer {layer_idx})', 0.0, 0.9, float(cur.get('dropout', dropout)),help="Dropout rate for LSTM layers. Ignored for Conv1D and Dense layers.")
-        new_bidir = st.checkbox(f'Bidirectional (Layer {layer_idx})', value=bool(cur.get('bidirectional', bidirectional)),help="Whether the layer is bidirectional (only applicable for LSTM layers). Ignored for Conv1D and Dense layers." )
+        new_units = st.slider(f'Units/Filters (Layer {layer_idx})', 4, 1024, int(cur.get('hiddenSize', hiddenSize)), key=f'layer_units_{layer_idx}', help="Number of units for LSTM/Dense or filters for Conv1D.")
+        new_dropout = st.slider(f'Dropout (Layer {layer_idx})', 0.0, 0.9, float(cur.get('dropout', dropout)), key=f'layer_dropout_{layer_idx}',help="Dropout rate for LSTM layers. Ignored for Conv1D and Dense layers.")
+        new_bidir = st.checkbox(f'Bidirectional (Layer {layer_idx})', value=bool(cur.get('bidirectional', bidirectional)), key=f'layer_bidir_{layer_idx}',help="Whether the layer is bidirectional (only applicable for LSTM layers). Ignored for Conv1D and Dense layers." )
         new_kernel = None
         if new_type == 'Conv1D':
-            new_kernel = st.slider(f'Kernel Size (Layer {layer_idx})', 1, 11, int(cur.get('kernel_size', 3)))
+            new_kernel = st.slider(f'Kernel Size (Layer {layer_idx})', 1, 11, int(cur.get('kernel_size', 3)), key=f'layer_kernel_{layer_idx}')
 
         if st.button(f'Commit Layer {layer_idx}'):
             entry = {
@@ -1470,14 +1648,13 @@ if uploaded:
             if selectedCfg:
                 with open(os.path.join('configs', selectedCfg), 'r') as f:
                     loaded = json.load(f)
-                # apply loaded global values and layer_configs
-                g = loaded.get('global', {})
-                st.session_state['layer_configs'] = loaded.get('layer_configs', st.session_state.get('layer_configs', []))
-                # attempt to set globals (won't rewrite widgets state, but provide feedback)
-                st.success(f"Loaded {selectedCfg}")
-    MLContainer.subheader("Neural Network Architecture",help="Visualization of the neural network architecture based on the current configuration. This diagram updates in real-time as you modify the model settings, including the number of layers, hidden sizes, dropout rates, and bidirectionality. Each layer box displays its type and parameters, and arrows indicate the flow of data from input to output.")
+                st.session_state['_pending_loaded_model_cfg'] = loaded
+                st.session_state['_pending_loaded_model_name'] = selectedCfg
+                st.rerun()
 
-    directionMultiplier = 2 if bidirectional else 1
+        if st.session_state.get('_loaded_model_notice'):
+            st.success(st.session_state.pop('_loaded_model_notice'))
+    MLContainer.subheader("Neural Network Architecture",help="Visualization of the neural network architecture based on the current configuration. This diagram updates in real-time as you modify the model settings, including the number of layers, hidden sizes, dropout rates, and bidirectionality. Each layer box displays its type and parameters, and arrows indicate the flow of data from input to output.")
 
     dot = graphviz.Digraph()
     dot.attr(rankdir='LR')
@@ -1491,13 +1668,16 @@ if uploaded:
     for i in range(num_layers):
         name = f"LSTM_{i+1}"
         cfg = st.session_state['layer_configs'][i] if 'layer_configs' in st.session_state and i < len(st.session_state['layer_configs']) else {'hiddenSize': hiddenSize, 'dropout': dropout, 'bidirectional': bidirectional}
+        layer_activation = cfg.get('activation', activation)
+        if layer_activation in (None, 'None', 'Identity', 'linear'):
+            layer_activation = 'Linear'
         dot.node(name,
-              f"{cfg.get('type','LSTM')} {i+1}\nHidden: {cfg.get('hiddenSize')}\nDropout: {cfg.get('dropout')}\nBidir: {cfg.get('bidirectional')}",
+              f"{cfg.get('type','LSTM')} {i+1}\nHidden: {cfg.get('hiddenSize')}\nDropout: {cfg.get('dropout')}\nBidir: {cfg.get('bidirectional')}\nAct: {layer_activation}\nKernel: {cfg.get('kernel_size', 3)}",
               shape="box")
         dot.edge(previous, name)
         previous = name
 
-    dot.node("Output", f"Dense\nActivation: {activation}", shape="box")
+    dot.node("Output", "Dense\nUnits: 1\nActivation: Linear", shape="box")
     dot.edge(previous, "Output")
 
     MLContainer.graphviz_chart(dot)
@@ -1520,7 +1700,45 @@ if uploaded:
             status_boxes = {col: MLContainer.empty() for col in selected_targets}
 
             with ThreadPoolExecutor() as executor:
-                futures = {executor.submit(trainModelRemote, col, numericDf, attractionJson, config): col for col in selected_targets}
+                futures = {}
+                for col in selected_targets:
+                    # Check if auto-tune has been run for this column and use highlighted trial params
+                    training_config = dict(config)
+                    if 'tuneResults' in st.session_state and col in st.session_state['tuneResults']:
+                        tune_payload = st.session_state['tuneResults'][col]
+                        trial_rows = tune_payload.get('trials', [])
+                        if trial_rows:
+                            # Determine which trial to use based on stored highlight mode
+                            highlight_mode = st.session_state.get('tune_highlight_mode', 'None')
+                            highlight_idx = None
+                            
+                            tune_df = pd.DataFrame(trial_rows)
+                            for _col, _default in [('trainTimeS', 0.0), ('modelParams', 0)]:
+                                if _col not in tune_df.columns:
+                                    tune_df[_col] = _default
+                            tune_df = tune_df.replace([np.inf, -np.inf], np.nan).dropna(subset=['valLoss'])
+                            
+                            if highlight_mode == "Lowest Validation Loss":
+                                highlight_idx = int(tune_df['valLoss'].idxmin())
+                            elif highlight_mode == "Fastest Training":
+                                highlight_idx = int(tune_df['trainTimeS'].idxmin())
+                            elif highlight_mode == "Smallest Model":
+                                highlight_idx = int(tune_df['modelParams'].idxmin())
+                            
+                            if highlight_idx is not None and highlight_idx < len(trial_rows):
+                                highlighted_trial = trial_rows[highlight_idx]
+                                MLContainer.info(f"Using highlighted auto-tune trial for {col}: LR={highlighted_trial['learningRate']:.2e}, Hidden={highlighted_trial['hiddenSize']}, Layers={highlighted_trial['numLayers']}")
+                                training_config.update({
+                                    'hiddenSize': highlighted_trial.get('hiddenSize', config.get('hiddenSize')),
+                                    'numLayers': highlighted_trial.get('numLayers', config.get('numLayers')),
+                                    'dropout': highlighted_trial.get('dropout', config.get('dropout')),
+                                    'bidirectional': highlighted_trial.get('bidirectional', config.get('bidirectional')),
+                                    'learningRate': highlighted_trial.get('learningRate', config.get('learningRate')),
+                                    'batchSize': highlighted_trial.get('batchSize', config.get('batchSize')),
+                                    'optimizer': highlighted_trial.get('optimizer', config.get('optimizer'))
+                                })
+                    
+                    futures[executor.submit(trainModelRemote, col, numericDf, attractionJson, training_config)] = col
 
                 completed = 0
                 for future in as_completed(futures):
@@ -1751,8 +1969,17 @@ if uploaded:
 
             def _mc_predict(model, batch_tensor, n_mc):
                 """Run N MC-dropout passes; return (mean, std) arrays of shape (B,)."""
+                def _collapse_prediction(pred):
+                    arr = np.asarray(pred)
+                    arr = np.squeeze(arr)
+                    if arr.ndim == 0:
+                        return arr.reshape(1)
+                    if arr.ndim > 1:
+                        arr = arr[:, -1]
+                    return arr
+
                 passes = np.stack([
-                    model(batch_tensor, training=True).numpy().squeeze(-1)
+                    _collapse_prediction(model(batch_tensor, training=True).numpy())
                     for _ in range(n_mc)
                 ])  # (N_MC, B)
                 return passes.mean(axis=0), passes.std(axis=0)
@@ -1973,14 +2200,6 @@ if uploaded:
                         fig_scatter.add_trace(go.Scatter(x=[min_v, max_v], y=[min_v, max_v], mode='lines', name='1:1', line=dict(color='gray', dash='dash')))
                         st.plotly_chart(fig_scatter, use_container_width=True, key=f'diag_scatter_{column}')
 
-                        # fig_resid = go.Figure()
-                        # fig_resid.add_trace(go.Scatter(x=x_diag, y=resid_vals, mode='markers', name='Residuals', marker=dict(color='firebrick', size=4, opacity=0.6)))
-                        # fig_resid.update_layout(title=f"Residuals Over Time ({column})", xaxis_title='Time', yaxis_title='Observed - Predicted')
-                        # st.plotly_chart(fig_resid, use_container_width=True, key=f'diag_resid_{column}')
-
-                        # fig_hist_resid = px.histogram(resid_vals, nbins=40, title=f"Residual Distribution ({column})")
-                        # st.plotly_chart(fig_hist_resid, use_container_width=True, key=f'diag_hist_{column}')
-
                         if np.isfinite(std_vals).any():
                             fig_unc = go.Figure()
                             fig_unc.add_trace(go.Scatter(x=x_diag, y=1.96 * std_vals, mode='lines', name='95% half-width', line=dict(color='purple')))
@@ -1994,3 +2213,259 @@ if uploaded:
             dfFilled.to_csv(index=False),
             file_name="completed_dataset.csv"
         )
+
+    # ========================================================
+    # ---------------- SPATIAL LINKED VIEW -------------------
+    # ========================================================
+
+    spatialContainer = st.container()
+    SpatialContainer.subheader(
+        "Spatial Linked View",
+        help="Upload a GeoJSON file here to link map features to CSV columns named like 'catchment 1', 'catchment 2', etc. The numeric suffix is matched exactly to GeoJSON DB_CatchID."
+    )
+
+    geojson_source = geojson_uploaded
+
+    # precompute mapping so other tabs can use the mapping/filter state
+    if geojson_source is not None:
+        try:
+            geojson_data = _load_geojson_source(geojson_source)
+
+            # build mapping: linked_df, featureidkey, and catchment->columns mapping
+            try:
+                linked_df_temp, featureidkey_temp, catchment_to_columns_temp = _build_linked_geojson_map(numericDf, geojson_data, aggregation='latest')
+            except Exception:
+                linked_df_temp, featureidkey_temp = _build_linked_geojson_map(numericDf, geojson_data, aggregation='latest')
+                catchment_to_columns_temp = {int(r.db_catch_id): [r.column] for _, r in linked_df_temp.iterrows()}
+
+            st.session_state['geojson_data'] = geojson_data
+            st.session_state['linked_geojson_df'] = linked_df_temp
+            st.session_state['featureidkey'] = featureidkey_temp
+            st.session_state['catchment_to_columns'] = catchment_to_columns_temp
+
+            catchment_cols = [c for c in numericDf.columns if _extract_catchment_id(c) is not None]
+            if not catchment_cols:
+                SpatialContainer.warning("No CSV columns matching 'catchment x' were found.")
+            else:
+                # Extract sensor types by removing catchment pattern "[catchment x]" or " catchment x"
+                def _extract_sensor_type(col_name):
+                    """Extract sensor type by removing catchment number pattern."""
+                    return re.sub(r'\[?Catchment\s+\d{1,2}.*\]?\s*$', '', str(col_name), flags=re.IGNORECASE).strip()
+                
+                sensor_types = sorted(set(_extract_sensor_type(c) for c in catchment_cols))
+                
+                left_col, right_col = SpatialContainer.columns([1.0, 1.35], gap="large")
+
+                with left_col:
+                    left_col.markdown("**Linked catchment columns**")
+                    # Add sensor type filter
+                    selected_sensor_type = left_col.selectbox(
+                        "Filter by sensor type",
+                        options=sensor_types,
+                        index=0,
+                        help="Select which sensor type to display on the map and table."
+                    )
+                    
+                    # Filter catchment columns by selected sensor type
+                    filtered_catchment_cols = [c for c in catchment_cols if _extract_sensor_type(c) == selected_sensor_type]
+                    
+                    agg_mode = left_col.selectbox(
+                        "Value used on map",
+                        ["mean", "median","latest"],
+                        index=0,
+                        help="Choose how values from each catchment column are summarized before mapping them to the matching DB_CatchID feature."
+                    )
+
+                    linked_df, featureidkey, catchment_to_columns_local = _build_linked_geojson_map(numericDf[filtered_catchment_cols], geojson_data, aggregation=agg_mode)
+                    if linked_df.empty:
+                        left_col.warning("GeoJSON features did not match any columns for the selected sensor type.")
+                    else:
+                        left_col.dataframe(
+                            linked_df.sort_values(["db_catch_id"]),
+                            use_container_width=True,
+                            height=360
+                        )
+                        left_col.caption(f"Showing columns for sensor type: '{selected_sensor_type}'. Each GeoJSON feature is matched using DB_CatchID → the matching catchment number in the CSV column name.")
+
+                        # Map-click selection is stored here and drives the visualizations below.
+                        selected_opt = st.session_state.get('selected_catchment_option', '')
+                        if selected_opt:
+                            left_col.info(f"Selected catchment: {selected_opt}")
+                        else:
+                            left_col.info("Click a catchment on the map to select it.")
+
+                        show_ts = left_col.checkbox("Show time series & stats for selected catchment", value=True, key='show_ts')
+
+                with right_col:
+                    linked_df, featureidkey, catchment_to_columns_local = _build_linked_geojson_map(numericDf[filtered_catchment_cols], geojson_data, aggregation=agg_mode)
+                    if not linked_df.empty:
+                        center, zoom = _geojson_bounds_and_center(geojson_data)
+                        fig_map = px.choropleth_mapbox(
+                            linked_df,
+                            geojson=geojson_data,
+                            locations="feature_id",
+                            color="value",
+                            featureidkey=featureidkey,
+                            hover_name="field_name",
+                            hover_data={"db_catch_id": True, "columns": True, "value": ":.4f", "feature_id": False},
+                            zoom=zoom,
+                            center=center,
+                            height=800,
+                            opacity=0.62,
+                            color_continuous_scale=[[0, "#dbeafe"], [1, "#2563eb"]]
+                        )
+                        fig_map.update_traces(marker_line_width=1.2, marker_line_color="white")
+
+                        # If a catchment is selected, overlay a highlighted trace for it
+                        selected_opt = st.session_state.get('selected_catchment_option', '')
+                        if selected_opt:
+                            try:
+                                sel_id = int(selected_opt.split('—')[0].strip())
+                                sel_df = linked_df[linked_df.db_catch_id == sel_id]
+                                if not sel_df.empty:
+                                    sel_fig = px.choropleth_mapbox(
+                                        sel_df,
+                                        geojson=geojson_data,
+                                        locations='feature_id',
+                                        color='value',
+                                        featureidkey=featureidkey,
+                                        hover_name='field_name',
+                                        zoom=zoom,
+                                        center=center,
+                                        height=800,
+                                        opacity=1.0,
+                                        color_continuous_scale=[[0, '#ffd6d6'], [1, '#ff0000']]
+                                    )
+                                    # add the selected feature trace on top
+                                    if sel_fig.data:
+                                        fig_map.add_trace(sel_fig.data[0])
+                            except Exception:
+                                pass
+
+                        fig_map.update_layout(
+                            mapbox_style="open-street-map",
+                            coloraxis_showscale=True,
+                            margin=dict(l=0, r=0, t=0, b=0)
+                        )
+                        map_key = f"spatial_map_{selected_sensor_type}_{agg_mode}"
+                        map_event = None
+                        try:
+                            map_event = right_col.plotly_chart(
+                                fig_map,
+                                use_container_width=True,
+                                key=map_key,
+                                on_select="rerun",
+                                selection_mode=("points",)
+                            )
+                        except TypeError:
+                            # Older Streamlit versions don't support native Plotly selection.
+                            right_col.plotly_chart(fig_map, use_container_width=True, key=map_key)
+
+                        # Native Plotly selection path: click a point to select it
+                        try:
+                            selected_points = getattr(getattr(map_event, "selection", None), "points", None) if map_event is not None else None
+                            if selected_points:
+                                pt = selected_points[0]
+                                loc = None
+                                if isinstance(pt, dict):
+                                    loc = pt.get('location')
+                                    if loc is None:
+                                        customdata = pt.get('customdata')
+                                        if isinstance(customdata, (list, tuple)) and len(customdata):
+                                            loc = customdata[0]
+                                else:
+                                    loc = getattr(pt, 'location', None)
+                                    if loc is None:
+                                        customdata = getattr(pt, 'customdata', None)
+                                        if isinstance(customdata, (list, tuple)) and len(customdata):
+                                            loc = customdata[0]
+                                if loc is not None:
+                                    try:
+                                        sel_id_click = int(float(loc))
+                                        cols_for = catchment_to_columns_local.get(sel_id_click, [])
+                                        if cols_for:
+                                            current_sel = st.session_state.get('selected_catchment_option', '')
+                                            current_id = None
+                                            if current_sel:
+                                                try:
+                                                    current_id = int(current_sel.split('—')[0].strip())
+                                                except Exception:
+                                                    current_id = None
+
+                                            if current_id == sel_id_click:
+                                                st.session_state['selected_catchment_option'] = ''
+                                            else:
+                                                st.session_state['selected_catchment_option'] = f"{sel_id_click} — {', '.join(cols_for)}"
+                                            st.rerun()
+                                    except Exception:
+                                        pass
+                        except Exception:
+                            pass
+
+                        # Fallback for environments that still use the optional event package
+                        if map_event is None:
+                            try:
+                                from streamlit_plotly_events import plotly_events
+                                ev = plotly_events(fig_map, click_event=True, hover_event=False, key=f"plot_evt_{selected_sensor_type}_{agg_mode}")
+                                if ev:
+                                    cand = ev[0]
+                                    loc = None
+                                    if isinstance(cand, dict):
+                                        loc = cand.get('location') or (cand.get('points') and cand['points'][0].get('location'))
+                                    if loc is not None:
+                                        try:
+                                            sel_id_click = int(float(loc))
+                                            cols_for = catchment_to_columns_local.get(sel_id_click, [])
+                                            if cols_for:
+                                                current_sel = st.session_state.get('selected_catchment_option', '')
+                                                current_id = None
+                                                if current_sel:
+                                                    try:
+                                                        current_id = int(current_sel.split('—')[0].strip())
+                                                    except Exception:
+                                                        current_id = None
+
+                                                if current_id == sel_id_click:
+                                                    st.session_state['selected_catchment_option'] = ''
+                                                else:
+                                                    st.session_state['selected_catchment_option'] = f"{sel_id_click} — {', '.join(cols_for)}"
+                                                st.rerun()
+                                        except Exception:
+                                            pass
+                            except Exception:
+                                pass
+
+                        # Show time-series and stats for selection in the left pane
+                        if show_ts and selected_opt:
+                            try:
+                                sel_id = int(selected_opt.split('—')[0].strip())
+                                sel_row = linked_df[linked_df.db_catch_id == sel_id]
+                                if not sel_row.empty:
+                                    cols = sel_row.iloc[0]['columns']
+                                    # plot multiple linked columns for this catchment
+                                    plot_df = pd.DataFrame({'time': timeAxis.values})
+                                    for c in cols:
+                                        plot_df[c] = numericDf[c].values
+                                    ts_plot = px.line(plot_df, x='time', y=cols, labels={'time': 'Time'}, title=f"Time series: catchment {sel_id}")
+                                    left_col.plotly_chart(ts_plot, use_container_width=True)
+
+                                    # compute per-column stats
+                                    stats_rows = []
+                                    for c in cols:
+                                        s = pd.to_numeric(numericDf[c], errors='coerce')
+                                        stats_rows.append({
+                                            'column': c,
+                                            'count': int(s.count()),
+                                            'missing': int(s.isna().sum()),
+                                            'mean': float(s.mean(skipna=True)) if s.count() else np.nan,
+                                            'median': float(s.median(skipna=True)) if s.count() else np.nan,
+                                        })
+                                    left_col.dataframe(pd.DataFrame(stats_rows).set_index('column'))
+                            except Exception:
+                                left_col.info("Unable to render time series for selected catchment.")
+                    else:
+                        right_col.info("No linked features to display on the map.")
+        except Exception as e:
+            SpatialContainer.error(f"Failed to load linked GeoJSON: {e}")
+    else:
+        SpatialContainer.info("Upload a GeoJSON file next to the CSV upload to enable the linked split-screen map.")
